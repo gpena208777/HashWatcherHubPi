@@ -62,8 +62,10 @@ sudo systemctl restart hashwatcher-hub-pi
 ```
 
 ## Requirements
-
-- Raspberry Pi 4 or 5 (64-bit OS)
+- Pi Zero 2 W
+ -Pi 3B / 3B+
+- Pi 4B
+- Pi 5
 - Raspberry Pi OS Lite (Bookworm recommended)
 - Network connection (Ethernet or Wi-Fi)
 - Bluetooth (built-in on Pi 4/5) for BLE provisioning
