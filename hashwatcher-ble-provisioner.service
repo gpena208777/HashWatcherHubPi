@@ -1,0 +1,24 @@
+[Unit]
+Description=Hashwatcher BLE Wi-Fi Provisioner
+After=bluetooth.service network-pre.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/hashwatcher-hub-pi
+EnvironmentFile=-/etc/hashwatcher-hub-pi/hub.env
+ExecStartPre=/bin/sleep 2
+ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+ExecStartPre=/bin/sleep 1
+ExecStartPre=/usr/bin/hciconfig hci0 up
+ExecStartPre=/bin/sleep 1
+ExecStart=/opt/hashwatcher-hub-pi/.venv/bin/python /opt/hashwatcher-hub-pi/hub_ble_provisioner.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

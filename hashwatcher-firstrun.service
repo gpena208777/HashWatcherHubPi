@@ -1,0 +1,16 @@
+[Unit]
+Description=HashWatcher Gateway First-Boot Installer
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/opt/.hashwatcher-installed
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hashwatcher-firstrun.sh
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

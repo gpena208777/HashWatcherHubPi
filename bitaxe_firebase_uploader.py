@@ -1,0 +1,1505 @@
+#!/usr/bin/env python3
+"""Hashwatcher Pi Gateway Agent.
+
+Local bridge and miner proxy. No cloud backend -- the app connects to miners
+directly (via Tailscale when remote) or through this proxy on port 8787.
+"""
+
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import parse_qs, urlparse
+
+import requests
+from dotenv import load_dotenv
+
+import hashlib
+
+import tailscale_setup
+
+AGENT_VERSION = "1.0.0"
+GITHUB_REPO = "gpena208777/HashWatcherHubPi"
+
+
+def env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if value else default
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = env_str(name, str(default)).lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def parse_endpoints(raw: str) -> List[str]:
+    endpoints: List[str] = []
+    for item in raw.split(","):
+        endpoint = item.strip()
+        if not endpoint:
+            continue
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        endpoints.append(endpoint)
+    return endpoints
+
+
+def pick_first(data: Dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+class HubState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.started_at = time.time()
+        self.last_poll_at_iso: Optional[str] = None
+        self.last_poll_error: Optional[str] = None
+        self.last_miner_data: Dict[str, Any] = {}
+
+    def set_poll_success(self, data: Dict[str, Any]) -> None:
+        with self.lock:
+            self.last_poll_at_iso = now_iso()
+            self.last_miner_data = data
+            self.last_poll_error = None
+
+    def set_poll_error(self, error: str) -> None:
+        with self.lock:
+            self.last_poll_error = error
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            return {
+                "startedAtIso": datetime.fromtimestamp(self.started_at, tz=timezone.utc).isoformat(),
+                "uptimeSeconds": int(time.time() - self.started_at),
+                "lastPollAtIso": self.last_poll_at_iso,
+                "lastPollError": self.last_poll_error,
+                "lastMinerData": self.last_miner_data,
+            }
+
+
+class HubAgent:
+    def __init__(self) -> None:
+        load_dotenv()
+
+        self.pi_hostname = env_str("PI_HOSTNAME", "HashWatcherHub")
+        self.bitaxe_host = env_str("BITAXE_HOST", "")
+        self.bitaxe_scheme = env_str("BITAXE_SCHEME", "http")
+        self.endpoints = parse_endpoints(env_str("BITAXE_ENDPOINTS", "/system/info,/api/system/info"))
+        self.poll_seconds = max(5, env_int("POLL_SECONDS", 10))
+        self.http_timeout_seconds = max(2, env_int("HTTP_TIMEOUT_SECONDS", 5))
+
+        self.status_http_bind = env_str("STATUS_HTTP_BIND", "0.0.0.0")
+        self.status_http_port = max(1, env_int("STATUS_HTTP_PORT", 8787))
+        self.runtime_config_path = env_str("RUNTIME_CONFIG_PATH", "/opt/hashwatcher-hub-pi/runtime_config.json")
+
+        self.agent_id = env_str("AGENT_ID", socket.gethostname())
+        self.paired_device_type = ""
+        self.paired_miner_mac = ""
+        self.paired_miner_hostname = ""
+        self.paired = bool(self.bitaxe_host.strip())
+        self.user_subnet_cidr = ""
+
+        self.config_lock = threading.Lock()
+        self._load_runtime_config()
+        self._cpu_prev_total = 0
+        self._cpu_prev_idle = 0
+        total, idle = self._read_cpu_totals()
+        if total is not None and idle is not None:
+            self._cpu_prev_total = total
+            self._cpu_prev_idle = idle
+
+        self.session = requests.Session()
+        self.state = HubState()
+        self._update_progress: Dict[str, Any] = {"stage": "idle"}
+
+        self._error_log: List[Dict[str, Any]] = []
+        self._log_lock = threading.Lock()
+        self._max_log_entries = 200
+
+    def _log(self, source: str, message: str, level: str = "error") -> None:
+        entry: Dict[str, Any] = {
+            "ts": now_iso(),
+            "level": level,
+            "source": source,
+            "message": message,
+        }
+        print(f"[{entry['ts']}] [{level.upper()}] [{source}] {message}", flush=True)
+        with self._log_lock:
+            self._error_log.append(entry)
+            if len(self._error_log) > self._max_log_entries:
+                self._error_log = self._error_log[-self._max_log_entries:]
+
+    def _load_runtime_config(self) -> None:
+        if not os.path.exists(self.runtime_config_path):
+            return
+        try:
+            with open(self.runtime_config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            bitaxe_host = str(cfg.get("bitaxeHost", "")).strip()
+            endpoints = cfg.get("endpoints")
+            poll_seconds = cfg.get("pollSeconds")
+            paired_device_type = str(cfg.get("deviceType", "")).strip()
+            paired_miner_mac = str(cfg.get("minerMac", "")).strip()
+            paired_miner_hostname = str(cfg.get("minerHostname", "")).strip()
+            paired_flag = cfg.get("paired")
+            user_subnet_cidr = str(cfg.get("userSubnetCIDR", "")).strip()
+
+            if bitaxe_host:
+                self.bitaxe_host = bitaxe_host
+            if isinstance(endpoints, list) and endpoints:
+                self.endpoints = parse_endpoints(",".join(str(item) for item in endpoints if isinstance(item, str)))
+            if isinstance(poll_seconds, int):
+                self.poll_seconds = max(5, poll_seconds)
+            if paired_device_type:
+                self.paired_device_type = paired_device_type.lower()
+            if paired_miner_mac:
+                self.paired_miner_mac = paired_miner_mac.lower()
+            if paired_miner_hostname:
+                self.paired_miner_hostname = paired_miner_hostname
+            if isinstance(paired_flag, bool):
+                self.paired = paired_flag
+            else:
+                self.paired = bool(self.bitaxe_host.strip())
+            if user_subnet_cidr:
+                self.user_subnet_cidr = user_subnet_cidr
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[{now_iso()}] WARNING: failed to load runtime config: {exc}", flush=True)
+
+    def _persist_runtime_config(self) -> None:
+        cfg = {
+            "bitaxeHost": self.bitaxe_host,
+            "endpoints": self.endpoints,
+            "pollSeconds": self.poll_seconds,
+            "deviceType": self.paired_device_type,
+            "minerMac": self.paired_miner_mac,
+            "minerHostname": self.paired_miner_hostname,
+            "paired": self.paired,
+            "userSubnetCIDR": self.user_subnet_cidr,
+            "updatedAtIso": now_iso(),
+        }
+        os.makedirs(os.path.dirname(self.runtime_config_path), exist_ok=True)
+        with open(self.runtime_config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        try:
+            os.chmod(self.runtime_config_path, 0o600)
+        except Exception:
+            pass
+
+    def get_wifi_status(self) -> Dict[str, Any]:
+        """Return real Wi-Fi connection state from wlan0."""
+        info: Dict[str, Any] = {
+            "connected": False,
+            "ssid": None,
+            "ip": None,
+            "signalDbm": None,
+            "interface": "wlan0",
+        }
+
+        try:
+            result = subprocess.run(
+                ["iwgetid", "wlan0", "--raw"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info["ssid"] = result.stdout.strip()
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show", "wlan0"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", result.stdout)
+                if match:
+                    info["ip"] = match.group(1)
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["iwconfig", "wlan0"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                match = re.search(r"Signal level[=:](-?\d+)\s*dBm", result.stdout)
+                if match:
+                    info["signalDbm"] = int(match.group(1))
+        except Exception:
+            pass
+
+        info["connected"] = bool(info["ssid"] and info["ip"])
+        return info
+
+    def get_current_step(self) -> Dict[str, Any]:
+        """Return current onboarding step for status display."""
+        ts_status = tailscale_setup.status()
+        ts_authenticated = ts_status.get("authenticated", False)
+        wifi = self.get_wifi_status()
+        wifi_connected = wifi.get("connected", False)
+
+        step_num = 1
+        step_name = "Connect to Wi-Fi"
+        step_detail = "Join your network via BLE provisioning in the app."
+        if not wifi_connected:
+            pass
+        elif not ts_authenticated:
+            step_num = 2
+            step_name = "Set up Tailscale"
+            step_detail = f"Wi-Fi connected ({wifi.get('ssid', '?')}). Provide a Tailscale auth key to enable remote access. Generate one at login.tailscale.com \u2192 Settings \u2192 Keys."
+        else:
+            step_num = 3
+            step_name = "Ready"
+            ts_ip = ts_status.get("ip", "")
+            step_detail = f"Gateway is online. Tailscale IP: {ts_ip}. Miners are accessible locally and via Tailscale."
+        return {
+            "step": step_num,
+            "stepName": step_name,
+            "stepDetail": step_detail,
+            "totalSteps": 3,
+        }
+
+    def get_runtime_config(self) -> Dict[str, Any]:
+        with self.config_lock:
+            return {
+                "bitaxeHost": self.bitaxe_host,
+                "endpoints": self.endpoints,
+                "pollSeconds": self.poll_seconds,
+                "deviceType": self.paired_device_type,
+                "minerMac": self.paired_miner_mac,
+                "minerHostname": self.paired_miner_hostname,
+                "paired": self.paired,
+                "userSubnetCIDR": self.user_subnet_cidr,
+                "piHostname": self.pi_hostname,
+                "statusHttpPort": self.status_http_port,
+            }
+
+    def update_runtime_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        with self.config_lock:
+            if "bitaxeHost" in updates:
+                host = str(updates["bitaxeHost"]).strip()
+                self.bitaxe_host = host
+                self.paired = bool(host)
+            if "pollSeconds" in updates:
+                try:
+                    self.poll_seconds = max(5, int(updates["pollSeconds"]))
+                except (ValueError, TypeError):
+                    pass
+            if "endpoints" in updates and isinstance(updates["endpoints"], list):
+                raw_endpoints = [str(item) for item in updates["endpoints"] if str(item).strip()]
+                if raw_endpoints:
+                    self.endpoints = parse_endpoints(",".join(raw_endpoints))
+            if "deviceType" in updates:
+                self.paired_device_type = str(updates.get("deviceType") or "").strip().lower()
+            if "minerMac" in updates:
+                self.paired_miner_mac = str(updates.get("minerMac") or "").strip().lower()
+            if "minerHostname" in updates:
+                self.paired_miner_hostname = str(updates.get("minerHostname") or "").strip()
+            if "paired" in updates:
+                self.paired = bool(updates.get("paired"))
+
+            self._persist_runtime_config()
+            return self.get_runtime_config()
+
+    def reset_pairing(self) -> Dict[str, Any]:
+        with self.config_lock:
+            self.bitaxe_host = ""
+            self.paired = False
+            self.paired_device_type = ""
+            self.paired_miner_mac = ""
+            self.paired_miner_hostname = ""
+            self._persist_runtime_config()
+            return self.get_runtime_config()
+
+    def reset_wifi(self) -> Dict[str, Any]:
+        """Clear saved Wi-Fi credentials and disconnect Wi-Fi.
+
+        Tailscale and miner pairing are left untouched. The user will need
+        to re-provision Wi-Fi via BLE or the app.
+        """
+        wifi_creds_path = os.getenv("LAST_WIFI_PATH", "/opt/hashwatcher-hub-pi/last_wifi_credentials.json")
+        try:
+            if os.path.exists(wifi_creds_path):
+                os.remove(wifi_creds_path)
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["sudo", "nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.strip().splitlines():
+                parts = line.rsplit(":", 1)
+                if len(parts) == 2 and "wireless" in parts[1]:
+                    conn_name = parts[0]
+                    subprocess.run(
+                        ["sudo", "nmcli", "connection", "delete", conn_name],
+                        capture_output=True, text=True, timeout=10,
+                    )
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(["sudo", "nmcli", "device", "disconnect", "wlan0"],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+        def _delayed_restart() -> None:
+            time.sleep(2)
+            try:
+                subprocess.run(["sudo", "systemctl", "restart", "hashwatcher-hub-pi"],
+                               capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_restart, daemon=True).start()
+
+        return {"ok": True, "message": "Wi-Fi credentials cleared. Hub will restart in ~2 seconds. Re-provision via BLE or the app."}
+
+    def factory_reset(self) -> Dict[str, Any]:
+        """Wipe all config, disconnect Tailscale, drop Wi-Fi, and restart the service.
+
+        Mimics a fresh-from-box power-on so the full onboarding can be tested.
+        """
+        with self.config_lock:
+            self.bitaxe_host = ""
+            self.paired = False
+            self.paired_device_type = ""
+            self.paired_miner_mac = ""
+            self.paired_miner_hostname = ""
+
+            # Delete persisted runtime config
+            try:
+                if os.path.exists(self.runtime_config_path):
+                    os.remove(self.runtime_config_path)
+            except Exception:
+                pass
+
+        # Disconnect Tailscale
+        try:
+            tailscale_setup.logout()
+        except Exception:
+            pass
+
+        # Delete saved Wi-Fi credentials file
+        wifi_creds_path = os.getenv("LAST_WIFI_PATH", "/opt/hashwatcher-hub-pi/last_wifi_credentials.json")
+        try:
+            if os.path.exists(wifi_creds_path):
+                os.remove(wifi_creds_path)
+        except Exception:
+            pass
+
+        # Delete all Wi-Fi connection profiles from NetworkManager so it
+        # won't auto-reconnect.  `nmcli -t -f NAME,TYPE connection show`
+        # outputs lines like "MyNetwork:802-11-wireless".
+        try:
+            result = subprocess.run(
+                ["sudo", "nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.strip().splitlines():
+                parts = line.rsplit(":", 1)
+                if len(parts) == 2 and "wireless" in parts[1]:
+                    conn_name = parts[0]
+                    subprocess.run(
+                        ["sudo", "nmcli", "connection", "delete", conn_name],
+                        capture_output=True, text=True, timeout=10,
+                    )
+        except Exception:
+            pass
+
+        # Disconnect the Wi-Fi device as a belt-and-suspenders measure
+        try:
+            subprocess.run(["sudo", "nmcli", "device", "disconnect", "wlan0"],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+        # Also try wpa_cli for systems not using NetworkManager
+        try:
+            subprocess.run(["sudo", "wpa_cli", "-i", "wlan0", "disconnect"],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+        # Schedule a service restart so the HTTP response can be sent first
+        def _delayed_restart() -> None:
+            time.sleep(2)
+            try:
+                subprocess.run(["sudo", "systemctl", "restart", "hashwatcher-hub-pi"],
+                               capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_restart, daemon=True).start()
+
+        return {"ok": True, "message": "Factory reset complete. Wi-Fi profiles deleted. Gateway will restart in ~2 seconds."}
+
+    def self_check(self) -> Dict[str, Any]:
+        ts_status = tailscale_setup.status()
+        checks: Dict[str, Any] = {
+            "wifiConnected": self._get_local_ip() is not None,
+            "tailscaleAuthenticated": ts_status.get("authenticated", False),
+            "tailscaleOnline": ts_status.get("online", False),
+        }
+
+        ok = all([
+            checks["wifiConnected"],
+            checks["tailscaleAuthenticated"],
+        ])
+        return {"ok": ok, "checks": checks, "checkedAtIso": now_iso()}
+
+    def check_for_update(self) -> Dict[str, Any]:
+        """Query GitHub releases API for a newer version."""
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        try:
+            resp = requests.get(url, timeout=15, headers={"Accept": "application/vnd.github+json"})
+            if resp.status_code == 404:
+                return {"ok": True, "updateAvailable": False, "reason": "no releases published yet", "currentVersion": AGENT_VERSION}
+            resp.raise_for_status()
+            release = resp.json()
+        except Exception as exc:
+            return {"ok": False, "error": f"Failed to check GitHub: {exc}"}
+
+        tag = str(release.get("tag_name", "")).lstrip("v").strip()
+        if not tag:
+            return {"ok": False, "error": "Release has no version tag"}
+
+        deb_asset = None
+        for asset in release.get("assets", []):
+            name = asset.get("name", "")
+            if name.endswith(".deb"):
+                deb_asset = asset
+                break
+
+        update_available = tag != AGENT_VERSION
+        result: Dict[str, Any] = {
+            "ok": True,
+            "currentVersion": AGENT_VERSION,
+            "latestVersion": tag,
+            "updateAvailable": update_available,
+            "releaseName": release.get("name", ""),
+            "publishedAt": release.get("published_at", ""),
+            "releaseUrl": release.get("html_url", ""),
+        }
+        if deb_asset:
+            result["debAsset"] = {
+                "name": deb_asset["name"],
+                "size": deb_asset.get("size", 0),
+                "downloadUrl": deb_asset.get("browser_download_url", ""),
+            }
+        return result
+
+    def get_update_progress(self) -> Dict[str, Any]:
+        return dict(self._update_progress)
+
+    def apply_update(self) -> Dict[str, Any]:
+        """Start background download and install of the latest .deb from GitHub."""
+        if self._update_progress.get("stage") in ("downloading", "installing", "restarting"):
+            return {"ok": True, "message": "Update already in progress.", **self._update_progress}
+
+        check = self.check_for_update()
+        if not check.get("ok"):
+            return check
+        if not check.get("updateAvailable"):
+            return {"ok": True, "message": f"Already on latest version ({AGENT_VERSION})"}
+
+        deb_info = check.get("debAsset")
+        if not deb_info or not deb_info.get("downloadUrl"):
+            return {"ok": False, "error": "No .deb asset found in the latest release"}
+
+        self._update_progress = {
+            "stage": "downloading",
+            "percent": 0,
+            "version": check["latestVersion"],
+            "message": "Starting download...",
+        }
+
+        def _run_update() -> None:
+            download_url = deb_info["downloadUrl"]
+            total_size = deb_info.get("size", 0)
+            work_dir = "/opt/hashwatcher-hub-pi/updates"
+            os.makedirs(work_dir, exist_ok=True)
+            deb_path = os.path.join(work_dir, deb_info["name"])
+
+            try:
+                resp = requests.get(download_url, timeout=120, stream=True)
+                resp.raise_for_status()
+                sha = hashlib.sha256()
+                downloaded = 0
+                with open(deb_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=128 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            sha.update(chunk)
+                            downloaded += len(chunk)
+                            pct = int(downloaded * 100 / total_size) if total_size > 0 else 0
+                            self._update_progress = {
+                                "stage": "downloading",
+                                "percent": min(pct, 100),
+                                "version": check["latestVersion"],
+                                "message": f"Downloaded {downloaded // 1024} KB" + (f" / {total_size // 1024} KB" if total_size else ""),
+                            }
+            except Exception as exc:
+                self._update_progress = {"stage": "failed", "percent": 0, "error": f"Download failed: {exc}"}
+                return
+
+            self._update_progress = {
+                "stage": "installing",
+                "percent": 100,
+                "version": check["latestVersion"],
+                "message": "Installing package...",
+            }
+
+            try:
+                result = subprocess.run(
+                    ["sudo", "dpkg", "-i", deb_path],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.strip() or result.stdout.strip()
+                    self._update_progress = {"stage": "failed", "percent": 0, "error": f"dpkg install failed: {stderr}"}
+                    return
+            except Exception as exc:
+                self._update_progress = {"stage": "failed", "percent": 0, "error": f"Install failed: {exc}"}
+                return
+
+            self._update_progress = {
+                "stage": "restarting",
+                "percent": 100,
+                "version": check["latestVersion"],
+                "message": f"Updated to {check['latestVersion']}. Restarting...",
+                "previousVersion": AGENT_VERSION,
+                "sha256": sha.hexdigest(),
+            }
+
+            time.sleep(2)
+            try:
+                subprocess.run(["sudo", "systemctl", "restart", "hashwatcher-hub-pi"],
+                               capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run_update, daemon=True).start()
+        return {"ok": True, "message": "Update started.", **self._update_progress}
+
+    def _bitaxe_url(self, host: str, endpoint: str) -> str:
+        return f"{self.bitaxe_scheme}://{host}{endpoint}"
+
+    def _parse_payload_data(self, parsed: Any) -> Dict[str, Any]:
+        if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+            return parsed["data"]
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError(f"Unexpected JSON type: {type(parsed)}")
+
+    def _fetch_bitaxe_from_host(self, host: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+        for endpoint in self.endpoints:
+            url = self._bitaxe_url(host, endpoint)
+            try:
+                response = self.session.get(url, timeout=timeout_seconds)
+                response.raise_for_status()
+                parsed = response.json()
+                data = self._parse_payload_data(parsed)
+                return {
+                    "ip": host,
+                    "endpoint": endpoint,
+                    "source_url": url,
+                    "data": data,
+                }
+            except Exception:
+                continue
+        return None
+
+    def fetch_paired_miner(self) -> Optional[Dict[str, Any]]:
+        if not self.paired or not self.bitaxe_host.strip():
+            return None
+        result = self._fetch_bitaxe_from_host(self.bitaxe_host, float(self.http_timeout_seconds))
+        if not result:
+            return None
+        return {
+            "source_url": result["source_url"],
+            "endpoint": result["endpoint"],
+            "data": result["data"],
+        }
+
+    def proxy_miner_request(self, target_ip: str, path: str, method: str = "GET", body: Optional[bytes] = None) -> Dict[str, Any]:
+        """Proxy an HTTP request to a miner on the local network."""
+        if not target_ip or not target_ip.strip():
+            raise ValueError("target IP is required")
+
+        clean_path = path.strip()
+        if not clean_path.startswith("/"):
+            clean_path = "/" + clean_path
+
+        url = f"{self.bitaxe_scheme}://{target_ip.strip()}{clean_path}"
+        timeout = float(self.http_timeout_seconds)
+
+        if method.upper() == "POST":
+            response = self.session.post(url, data=body, timeout=timeout, headers={"Content-Type": "application/json"} if body else {})
+        else:
+            response = self.session.get(url, timeout=timeout)
+
+        try:
+            data = response.json()
+        except Exception:
+            data = response.text
+
+        return {
+            "ok": response.ok,
+            "statusCode": response.status_code,
+            "url": url,
+            "data": data,
+        }
+
+    def infer_device_type(self, data: Dict[str, Any], model: Any, hostname: Any) -> str:
+        explicit = pick_first(data, ["deviceType", "minerType"])
+        parts: List[str] = []
+        for value in [explicit, model, hostname]:
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip().lower())
+        combined = " ".join(parts)
+        if "bitdsk" in combined:
+            return "bitdsk"
+        if "octaxe" in combined or "octa" in combined:
+            return "octaxe"
+        if "nerdq" in combined or "qaxe" in combined:
+            return "nerdq"
+        return "bitaxe"
+
+    def discover_bitaxe_devices(self, cidr: Optional[str] = None) -> Dict[str, Any]:
+        network: ipaddress.IPv4Network
+        if cidr:
+            network = ipaddress.ip_network(cidr, strict=False)
+        else:
+            local_ip = self._get_local_ip()
+            if not local_ip:
+                raise RuntimeError("Unable to determine Pi local IP for subnet scan")
+            octets = local_ip.split(".")
+            network = ipaddress.ip_network(f"{octets[0]}.{octets[1]}.{octets[2]}.0/24", strict=False)
+
+        hosts = [str(ip) for ip in network.hosts()]
+        if len(hosts) > 1024:
+            hosts = hosts[:1024]
+
+        found: List[Dict[str, Any]] = []
+        start = time.time()
+
+        def worker(host: str) -> Optional[Dict[str, Any]]:
+            result = self._fetch_bitaxe_from_host(host, 0.8)
+            if not result:
+                return None
+            data = result["data"]
+            normalized = self.normalize(data)
+            return {
+                "ip": host,
+                "hostname": normalized.get("hostname"),
+                "mac": normalized.get("mac"),
+                "model": normalized.get("model"),
+                "deviceType": normalized.get("device_type"),
+                "firmware": normalized.get("firmware"),
+                "tempC": normalized.get("temp_c"),
+                "hashrateTHS": normalized.get("hashrate_ths"),
+                "powerW": normalized.get("power_w"),
+                "powerEfficiencyJTH": normalized.get("power_efficiency_j_th"),
+                "endpoint": result["endpoint"],
+            }
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = [executor.submit(worker, host) for host in hosts]
+            for future in as_completed(futures):
+                try:
+                    entry = future.result()
+                    if entry:
+                        found.append(entry)
+                except Exception:
+                    continue
+
+        found.sort(key=lambda item: item.get("ip", ""))
+        return {
+            "ok": True,
+            "scanCidr": str(network),
+            "scannedHosts": len(hosts),
+            "durationSeconds": round(time.time() - start, 2),
+            "devices": found,
+        }
+
+    def _get_local_ip(self) -> Optional[str]:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            sock.close()
+            return ip
+        except Exception:
+            return None
+
+    def _read_cpu_totals(self) -> tuple[Optional[int], Optional[int]]:
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as f:
+                line = f.readline().strip()
+            parts = line.split()
+            if len(parts) < 5 or parts[0] != "cpu":
+                return None, None
+            values = [int(v) for v in parts[1:]]
+            total = sum(values)
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            return total, idle
+        except Exception:
+            return None, None
+
+    def _cpu_usage_percent(self) -> Optional[float]:
+        total, idle = self._read_cpu_totals()
+        if total is None or idle is None:
+            return None
+        prev_total, prev_idle = self._cpu_prev_total, self._cpu_prev_idle
+        self._cpu_prev_total, self._cpu_prev_idle = total, idle
+        if prev_total <= 0 or total <= prev_total:
+            return None
+        total_delta = total - prev_total
+        idle_delta = idle - prev_idle
+        busy_delta = max(0, total_delta - idle_delta)
+        return round((busy_delta / total_delta) * 100.0, 2) if total_delta > 0 else None
+
+    def _memory_telemetry(self) -> Dict[str, Optional[float]]:
+        result: Dict[str, Optional[float]] = {"totalMB": None, "availableMB": None, "usedPercent": None}
+        try:
+            values: Dict[str, int] = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    key, _, rest = line.partition(":")
+                    fields = rest.strip().split()
+                    if fields:
+                        values[key] = int(fields[0])
+            total_kb = values.get("MemTotal")
+            avail_kb = values.get("MemAvailable")
+            if total_kb and avail_kb is not None:
+                used_kb = max(0, total_kb - avail_kb)
+                result["totalMB"] = round(total_kb / 1024.0, 2)
+                result["availableMB"] = round(avail_kb / 1024.0, 2)
+                result["usedPercent"] = round((used_kb / total_kb) * 100.0, 2)
+        except Exception:
+            pass
+        return result
+
+    def _disk_telemetry(self) -> Dict[str, Optional[float]]:
+        result: Dict[str, Optional[float]] = {"totalGB": None, "freeGB": None, "usedPercent": None}
+        try:
+            stats = os.statvfs("/")
+            total = stats.f_blocks * stats.f_frsize
+            free = stats.f_bavail * stats.f_frsize
+            used = max(0, total - free)
+            if total > 0:
+                result["totalGB"] = round(total / (1024.0 ** 3), 3)
+                result["freeGB"] = round(free / (1024.0 ** 3), 3)
+                result["usedPercent"] = round((used / total) * 100.0, 2)
+        except Exception:
+            pass
+        return result
+
+    def _soc_temp_c(self) -> Optional[float]:
+        candidates = ["/sys/class/thermal/thermal_zone0/temp", "/sys/class/hwmon/hwmon0/temp1_input"]
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+                value = float(raw)
+                if value > 1000:
+                    value = value / 1000.0
+                return round(value, 2)
+            except Exception:
+                continue
+        return None
+
+    def get_pi_telemetry(self) -> Dict[str, Any]:
+        load1, load5, load15 = (None, None, None)
+        try:
+            load = os.getloadavg()
+            load1, load5, load15 = round(load[0], 3), round(load[1], 3), round(load[2], 3)
+        except Exception:
+            pass
+
+        return {
+            "timestampIso": now_iso(),
+            "hostname": socket.gethostname(),
+            "localIp": self._get_local_ip(),
+            "cpuPercent": self._cpu_usage_percent(),
+            "cpuCount": os.cpu_count(),
+            "loadAvg1m": load1,
+            "loadAvg5m": load5,
+            "loadAvg15m": load15,
+            "memory": self._memory_telemetry(),
+            "diskRoot": self._disk_telemetry(),
+            "socTempC": self._soc_temp_c(),
+            "agentUptimeSeconds": int(time.time() - self.state.started_at),
+        }
+
+    def normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        hashrate_ths = pick_first(data, ["hashRate", "hashRate_1m", "hashRateavg"])
+        temp_c = pick_first(data, ["temp", "boardtemp", "boardTemp"])
+        vr_temp_c = pick_first(data, ["vrTemp", "vrtemp"])
+        power_w = pick_first(data, ["power"])
+        hashrate_numeric = to_float(hashrate_ths)
+        power_numeric = to_float(power_w)
+        efficiency_j_th: Optional[float] = None
+        if hashrate_numeric is not None and power_numeric is not None and hashrate_numeric > 0:
+            efficiency_j_th = round(power_numeric / hashrate_numeric, 3)
+        model = pick_first(data, ["deviceModel", "boardVersion", "ASICModel", "asicmodel"])
+        hostname = pick_first(data, ["hostname", "hostip"])
+        device_type = self.infer_device_type(data, model=model, hostname=hostname)
+
+        return {
+            "hostname": hostname,
+            "ip": pick_first(data, ["hostip"]),
+            "mac": pick_first(data, ["macAddr", "mac"]),
+            "model": model,
+            "device_type": device_type,
+            "firmware": pick_first(data, ["version", "minerversion"]),
+            "hashrate_ths": hashrate_ths,
+            "temp_c": temp_c,
+            "vr_temp_c": vr_temp_c,
+            "power_w": power_w,
+            "power_efficiency_j_th": efficiency_j_th,
+            "fanspeed": pick_first(data, ["fanspeed", "fanspeedrpm", "fanrpm"]),
+            "shares_accepted": pick_first(data, ["sharesAccepted"]),
+            "shares_rejected": pick_first(data, ["sharesRejected"]),
+            "best_diff": pick_first(data, ["bestDiff", "bestSessionDiff"]),
+            "uptime_seconds": pick_first(data, ["uptimeSeconds"]),
+            "wifi_status": pick_first(data, ["wifiStatus"]),
+            "wifi_rssi": pick_first(data, ["wifiRSSI"]),
+            "stratum_url": pick_first(data, ["stratumURL"]),
+            "stratum_port": pick_first(data, ["stratumPort"]),
+        }
+
+    def start_status_server(self) -> None:
+        agent = self
+
+        class HubHandler(BaseHTTPRequestHandler):
+            def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+                body = json.dumps(payload, default=str).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _send_html(self, body: str, status: int = 200) -> None:
+                data = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.end_headers()
+
+            def do_GET(self) -> None:  # noqa: N802
+                parsed = urlparse(self.path)
+                snapshot = agent.state.snapshot()
+                live_pi = agent.get_pi_telemetry()
+                current_step = agent.get_current_step()
+                ts_status = tailscale_setup.status()
+                wifi_status = agent.get_wifi_status()
+
+                status = {
+                    "ok": True,
+                    "agentId": agent.agent_id,
+                    "piHostname": agent.pi_hostname,
+                    "agentVersion": AGENT_VERSION,
+                    "bitaxeHost": agent.bitaxe_host,
+                    "isPaired": agent.paired,
+                    "pollSeconds": agent.poll_seconds,
+                    "statusHttpPort": agent.status_http_port,
+                    "pairedDeviceType": agent.paired_device_type or None,
+                    "pairedMinerMac": agent.paired_miner_mac or None,
+                    "pairedMinerHostname": agent.paired_miner_hostname or None,
+                    "endpoints": agent.endpoints,
+                    "piTelemetry": live_pi,
+                    "tailscale": ts_status,
+                    "wifi": wifi_status,
+                    "currentStep": current_step,
+                    **snapshot,
+                }
+
+                if parsed.path in ["/api/status", "/healthz"]:
+                    self._send_json(status)
+                    return
+
+                if parsed.path == "/api/config":
+                    self._send_json({"ok": True, "config": agent.get_runtime_config()})
+                    return
+
+                if parsed.path == "/api/discover":
+                    query = parse_qs(parsed.query)
+                    cidr = (query.get("cidr") or [None])[0]
+                    try:
+                        self._send_json(agent.discover_bitaxe_devices(cidr=cidr))
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self._send_json({"ok": False, "error": str(exc)}, status=500)
+                    return
+
+                if parsed.path == "/api/self-check":
+                    self._send_json(agent.self_check())
+                    return
+
+                if parsed.path == "/api/logs":
+                    query = parse_qs(parsed.query)
+                    limit = int((query.get("limit") or ["100"])[0])
+                    level_filter = (query.get("level") or [None])[0]
+                    with agent._log_lock:
+                        entries = list(agent._error_log)
+                    if level_filter:
+                        entries = [e for e in entries if e.get("level") == level_filter]
+                    self._send_json({
+                        "ok": True,
+                        "count": len(entries),
+                        "entries": entries[-limit:],
+                    })
+                    return
+
+                if parsed.path == "/api/tailscale/status":
+                    self._send_json({"ok": True, **tailscale_setup.status()})
+                    return
+
+                if parsed.path == "/api/wifi/status":
+                    self._send_json({"ok": True, **agent.get_wifi_status()})
+                    return
+
+                if parsed.path == "/api/miner/data":
+                    result = agent.fetch_paired_miner()
+                    if result:
+                        normalized = agent.normalize(result["data"])
+                        self._send_json({"ok": True, "raw": result["data"], "normalized": normalized})
+                    else:
+                        self._send_json({"ok": False, "error": "No paired miner or miner unreachable"}, status=503)
+                    return
+
+                if parsed.path.endswith(".png") and "/" not in parsed.path.lstrip("/"):
+                    img_name = parsed.path.lstrip("/")
+                    img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), img_name)
+                    if os.path.isfile(img_path):
+                        with open(img_path, "rb") as img_f:
+                            img_data = img_f.read()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/png")
+                        self.send_header("Content-Length", str(len(img_data)))
+                        self.send_header("Cache-Control", "public, max-age=86400")
+                        self.end_headers()
+                        self.wfile.write(img_data)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                    return
+
+                if parsed.path in ["/", "/index.html"]:
+                    pi_mem = live_pi.get("memory", {}) if isinstance(live_pi, dict) else {}
+                    pi_disk = live_pi.get("diskRoot", {}) if isinstance(live_pi, dict) else {}
+                    wifi_ok = wifi_status.get("connected", False)
+                    wifi_ssid = wifi_status.get("ssid") or "-"
+                    wifi_ip = wifi_status.get("ip") or "-"
+                    wifi_signal = wifi_status.get("signalDbm")
+                    ts_online = ts_status.get("online", False)
+                    ts_authenticated = ts_status.get("authenticated", False)
+                    setup_done = wifi_ok and ts_authenticated
+
+                    soc_c = live_pi.get("socTempC")
+                    soc_hot = False
+                    if soc_c is not None:
+                        soc_f = int(soc_c * 9 / 5 + 32)
+                        soc_display = f"{int(soc_c)} °C / {soc_f} °F"
+                        soc_hot = soc_c >= 65
+                    else:
+                        soc_display = "-"
+
+                    uptime_s = live_pi.get("agentUptimeSeconds")
+                    if uptime_s is not None:
+                        _s = int(uptime_s)
+                        _d, _s = divmod(_s, 86400)
+                        _h, _s = divmod(_s, 3600)
+                        _m, _ = divmod(_s, 60)
+                        uptime_display = f"{_d}d {_h}h {_m}m" if _d > 0 else f"{_h}h {_m}m" if _h > 0 else f"{_m}m"
+                    else:
+                        uptime_display = "-"
+
+                    mem_used = pi_mem.get("usedPercent", "-")
+                    total_mb = live_pi.get("memory", {}).get("totalMB")
+                    avail_mb = live_pi.get("memory", {}).get("availableMB")
+                    if total_mb is not None and avail_mb is not None:
+                        used_mb = total_mb - avail_mb
+                        mem_display = f"{int(used_mb)} / {int(total_mb)} MB"
+                    else:
+                        mem_display = "-"
+
+                    disk_total = pi_disk.get("totalGB") or pi_disk.get("totalGb")
+                    disk_free = pi_disk.get("freeGB") or pi_disk.get("freeGb")
+                    if disk_total is not None and disk_free is not None:
+                        disk_used_val = round(disk_total - disk_free, 1)
+                        disk_display = f"{disk_used_val} / {round(disk_total, 1)} GB"
+                    else:
+                        disk_display = "-"
+                    disk_pct = pi_disk.get("usedPercent", "-")
+
+                    ts_ip = str(ts_status.get("ip", "-"))
+                    routes = ts_status.get("advertisedRoutes", []) or []
+                    if not routes and agent.user_subnet_cidr:
+                        routes = [agent.user_subnet_cidr]
+                    ts_routes = ", ".join(routes or ["-"])
+                    ts_status_label = "Online" if ts_online else "Offline"
+                    ts_badge_class = "badge-green" if ts_online else "badge-red"
+
+                    key_expired = ts_status.get("keyExpired", False)
+                    key_expiring = ts_status.get("keyExpiringSoon", False)
+                    expiry_banner = ""
+                    if key_expired:
+                        expiry_banner = '<div class="alert alert-red">Tailscale key expired &mdash; remote access unavailable. <a href="https://login.tailscale.com/admin/machines" target="_blank">Reauthorize &rarr;</a></div>'
+                    elif key_expiring:
+                        expiry_banner = '<div class="alert alert-yellow">Key expiring soon. <a href="https://login.tailscale.com/admin/machines" target="_blank">Disable key expiry &rarr;</a></div>'
+
+                    html = f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{agent.pi_hostname} &mdash; HashWatcher Hub Pi</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif; background: #000; color: #fff; margin: 0; padding: 16px; line-height: 1.5; min-height: 100vh; overflow-x: hidden; }}
+    .bg-canvas {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; overflow: hidden; }}
+    .bg-orb {{ position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.35; animation: drift 20s ease-in-out infinite alternate; }}
+    .bg-orb:nth-child(1) {{ width: 400px; height: 400px; background: #00cc66; top: -10%; left: -10%; animation-duration: 22s; }}
+    .bg-orb:nth-child(2) {{ width: 350px; height: 350px; background: #33e680; top: 40%; right: -15%; animation-duration: 18s; animation-delay: -5s; }}
+    .bg-orb:nth-child(3) {{ width: 300px; height: 300px; background: #004d26; bottom: -5%; left: 20%; animation-duration: 25s; animation-delay: -10s; }}
+    @keyframes drift {{ 0% {{ transform: translate(0,0) scale(1); }} 33% {{ transform: translate(30px,-40px) scale(1.05); }} 66% {{ transform: translate(-20px,20px) scale(0.95); }} 100% {{ transform: translate(10px,-10px) scale(1.02); }} }}
+    .container {{ max-width: 640px; margin: 0 auto; position: relative; z-index: 1; }}
+    .card {{ background: rgba(28,28,30,0.85); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 20px; margin-bottom: 16px; }}
+    h2 {{ margin: 0 0 12px; font-size: 1.4em; font-weight: 700; }}
+    h3 {{ margin: 16px 0 8px; font-size: 1.1em; font-weight: 600; }}
+    .grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }}
+    .grid > div {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 10px 12px; font-size: 0.9em; color: rgba(255,255,255,0.55); }}
+    .grid > div strong {{ color: #fff; }}
+    .muted {{ color: rgba(255,255,255,0.55); }}
+    code {{ color: #00cc66; background: rgba(0,204,102,0.1); padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }}
+    a {{ color: #33e680; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; color: #66ff99; }}
+    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-weight: 600; }}
+    .badge-green {{ background: rgba(0,204,102,0.15); color: #33e680; }}
+    .badge-red {{ background: rgba(239,68,68,0.15); color: #fca5a5; }}
+    .badge-yellow {{ background: rgba(245,158,11,0.15); color: #fde68a; }}
+    .alert {{ padding: 12px 16px; border-radius: 12px; margin: 12px 0; font-size: 0.9em; }}
+    .alert-red {{ background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #fca5a5; }}
+    .alert-red a {{ color: #fca5a5; text-decoration: underline; }}
+    .alert-yellow {{ background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); color: #fde68a; }}
+    .alert-yellow a {{ color: #fde68a; text-decoration: underline; }}
+    .info-row {{ display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }}
+    .info-row:last-child {{ border-bottom: none; }}
+    .info-label {{ color: rgba(255,255,255,0.5); }}
+    .divider {{ border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 16px 0; }}
+    .btn {{ display: inline-block; background: #00cc66; color: #000; padding: 8px 16px; border-radius: 10px; font-weight: 600; font-size: 0.9em; text-decoration: none; border: none; cursor: pointer; }}
+    .btn:hover {{ background: #33e680; text-decoration: none; }}
+    .btn-warn {{ background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); padding: 8px 14px; border-radius: 10px; font-weight: 600; font-size: 0.85em; cursor: pointer; }}
+    .btn-warn:hover {{ background: rgba(239,68,68,0.25); }}
+    .btn-secondary {{ background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.8); border: 1px solid rgba(255,255,255,0.12); padding: 8px 14px; border-radius: 10px; font-weight: 600; font-size: 0.85em; cursor: pointer; }}
+    .btn-secondary:hover {{ background: rgba(255,255,255,0.12); }}
+    pre {{ white-space: pre-wrap; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 10px; font-size: 0.85em; color: rgba(255,255,255,0.7); }}
+    .brand-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 16px; font-size: 1.3em; font-weight: 700; }}
+    .setup-card {{ background: rgba(0,204,102,0.08); border: 1px solid rgba(0,204,102,0.25); border-radius: 14px; padding: 20px; margin-bottom: 16px; text-align: center; }}
+    .setup-card h3 {{ margin: 0 0 8px; color: #33e680; }}
+    .setup-card p {{ margin: 0 0 14px; color: rgba(255,255,255,0.6); font-size: 0.9em; }}
+  </style>
+</head>
+<body>
+  <div class="bg-canvas"><div class="bg-orb"></div><div class="bg-orb"></div><div class="bg-orb"></div></div>
+  <div class="container">
+
+    <div class="brand-header">
+      <img src="/icon.png" alt="HashWatcher" style="width:36px;height:36px;border-radius:8px;">
+      <span>HashWatcher Hub Pi</span>
+      <a href="https://x.com/HashWatcher" target="_blank" title="Follow @HashWatcher on X" style="margin-left:auto;display:inline-flex;align-items:center;color:rgba(255,255,255,0.6);transition:color 0.2s;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+      </a>
+    </div>
+
+    {'<div class="setup-card"><h3>Finish Setup in the HashWatcher App</h3><p>Open the HashWatcher app on your iPhone to configure Wi-Fi, Tailscale, and pair your miners.</p><a class="btn" href="https://www.HashWatcher.app" target="_blank">Download Free at HashWatcher.app</a></div>' if not setup_done else ''}
+
+    <div class="card">
+      <h2>Status <span class="badge {ts_badge_class}">{ts_status_label}</span></h2>
+
+      <div class="info-row">
+        <span class="info-label">Wi-Fi</span>
+        <span><code>{'connected' if wifi_ok else 'disconnected'}</code>{' &middot; ' + wifi_ssid if wifi_ok else ''}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Local IP</span>
+        <code>{wifi_ip if wifi_ok else '-'}</code>
+      </div>
+      {f'<div class="info-row"><span class="info-label">Signal</span><code>{wifi_signal} dBm</code></div>' if wifi_signal is not None else ''}
+      <div class="info-row">
+        <span class="info-label">Tailscale IP</span>
+        <code>{ts_ip}</code>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Routes</span>
+        <code>{ts_routes}</code>
+      </div>
+      {expiry_banner}
+
+      <hr class="divider">
+      <h3 style="margin:8px 0 10px;">System</h3>
+      <div class="grid">
+        <div>CPU <strong>{live_pi.get("cpuPercent", "-")}%</strong></div>
+        <div>SoC Temp <strong style="{'color:#ff453a;' if soc_hot else ''}">{soc_display}</strong></div>
+        <div>Load <strong>{live_pi.get("loadAvg1m", "-")}</strong> / {live_pi.get("loadAvg5m", "-")} / {live_pi.get("loadAvg15m", "-")}</div>
+        <div>Memory <strong>{mem_display}</strong> ({mem_used}%)</div>
+        <div>Disk <strong>{disk_display}</strong> ({disk_pct}%)</div>
+        <div>Uptime <strong>{uptime_display}</strong></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 12px;">Tailscale</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button class="{'btn' if ts_online else 'btn-secondary'}" id="tsToggleBtn" onclick="toggleTailscale()" style="min-width:140px;">
+          {'Turn Off' if ts_online else 'Turn On'}
+        </button>
+        <span class="muted" style="font-size:0.85em;" id="tsToggleStatus">{'Connected' if ts_online else 'Off'}</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 12px;">Maintenance</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn-secondary" onclick="runSelfCheck()">Run Self-Check</button>
+        <button class="btn-warn" onclick="resetWifi()">Reset Wi-Fi</button>
+        <button class="btn-warn" onclick="factoryReset()">Factory Reset</button>
+      </div>
+      <pre id="actionStatus">No actions run yet.</pre>
+      <p class="muted" style="font-size:0.8em;margin:10px 0 0;">API: <a href="/api/status">/api/status</a> &middot; <a href="/api/wifi/status">/api/wifi/status</a> &middot; <a href="/api/self-check">/api/self-check</a></p>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 12px;">Software Update</h3>
+      <p class="muted" style="margin:0 0 12px;font-size:0.85em;">Current version: <strong>{AGENT_VERSION}</strong></p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button class="btn-secondary" id="checkUpdateBtn" onclick="checkForUpdate()">Check for Update</button>
+        <button class="btn" id="applyUpdateBtn" onclick="applyUpdate()" style="display:none;">Install Update</button>
+      </div>
+      <pre id="updateStatus" style="display:none;"></pre>
+    </div>
+
+  </div>
+
+  <script>
+    let tsOn = {'true' if ts_online else 'false'};
+    async function toggleTailscale() {{
+      const btn = document.getElementById('tsToggleBtn');
+      const st = document.getElementById('tsToggleStatus');
+      const endpoint = tsOn ? '/api/tailscale/down' : '/api/tailscale/up';
+      btn.disabled = true;
+      st.textContent = tsOn ? 'Turning off...' : 'Turning on...';
+      try {{
+        const r = await fetch(endpoint, {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+        const p = await r.json();
+        if (p.ok) {{
+          tsOn = !tsOn;
+          btn.textContent = tsOn ? 'Turn Off' : 'Turn On';
+          btn.className = tsOn ? 'btn' : 'btn-secondary';
+          st.textContent = tsOn ? 'Connected' : 'Off';
+        }} else {{
+          st.textContent = 'Error: ' + (p.error || 'unknown');
+        }}
+      }} catch (e) {{
+        st.textContent = 'Request failed';
+      }}
+      btn.disabled = false;
+    }}
+    async function runSelfCheck() {{
+      const el = document.getElementById('actionStatus');
+      el.textContent = 'Running self-check...';
+      const r = await fetch('/api/self-check');
+      el.textContent = JSON.stringify(await r.json(), null, 2);
+    }}
+    async function resetWifi() {{
+      if (!confirm('Reset Wi-Fi\\n\\nThis will clear saved Wi-Fi credentials and disconnect Wi-Fi. Tailscale config is kept.\\n\\nContinue?')) return;
+      const el = document.getElementById('actionStatus');
+      el.textContent = 'Resetting Wi-Fi...';
+      try {{
+        const r = await fetch('/api/reset-wifi', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+        const p = await r.json();
+        el.textContent = JSON.stringify(p, null, 2);
+      }} catch (e) {{
+        el.textContent = 'Wi-Fi reset sent. Connection may be lost (expected).';
+      }}
+    }}
+    async function factoryReset() {{
+      if (!confirm('Factory Reset\\n\\nThis will clear ALL config (Wi-Fi, Tailscale, pairing) and restart the hub.\\n\\nContinue?')) return;
+      const el = document.getElementById('actionStatus');
+      el.textContent = 'Factory resetting...';
+      try {{
+        const r = await fetch('/api/factory-reset', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+        const p = await r.json();
+        el.textContent = JSON.stringify(p, null, 2);
+        if (p.ok) el.textContent += '\\n\\nHub is restarting. Reconnect via the HashWatcher app.';
+      }} catch (e) {{
+        el.textContent = 'Factory reset sent. Connection lost (expected).\\nReconnect via the HashWatcher app.';
+      }}
+    }}
+    async function checkForUpdate() {{
+      const btn = document.getElementById('checkUpdateBtn');
+      const applyBtn = document.getElementById('applyUpdateBtn');
+      const el = document.getElementById('updateStatus');
+      btn.disabled = true;
+      btn.textContent = 'Checking...';
+      el.style.display = 'block';
+      el.textContent = 'Checking GitHub for updates...';
+      try {{
+        const r = await fetch('/api/update/check');
+        const p = await r.json();
+        if (!p.ok) {{
+          el.textContent = 'Error: ' + (p.error || 'unknown');
+        }} else if (p.updateAvailable) {{
+          el.textContent = 'Update available: v' + p.latestVersion + '\\nPublished: ' + (p.publishedAt || 'unknown');
+          if (p.debAsset) el.textContent += '\\nPackage: ' + p.debAsset.name + ' (' + Math.round(p.debAsset.size / 1024) + ' KB)';
+          applyBtn.style.display = 'inline-block';
+        }} else {{
+          el.textContent = 'You are on the latest version (v' + p.currentVersion + ')';
+          applyBtn.style.display = 'none';
+        }}
+      }} catch (e) {{
+        el.textContent = 'Failed to check for updates.';
+      }}
+      btn.disabled = false;
+      btn.textContent = 'Check for Update';
+    }}
+    async function applyUpdate() {{
+      if (!confirm('Install Update\\n\\nThis will download and install the latest version from GitHub. The hub will restart afterward.\\n\\nContinue?')) return;
+      const btn = document.getElementById('applyUpdateBtn');
+      const el = document.getElementById('updateStatus');
+      btn.disabled = true;
+      btn.textContent = 'Installing...';
+      el.textContent = 'Downloading and installing update...';
+      try {{
+        const r = await fetch('/api/update/apply', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+        const p = await r.json();
+        el.textContent = JSON.stringify(p, null, 2);
+        if (p.ok) {{
+          el.textContent += '\\n\\nHub is restarting with the new version.';
+          btn.style.display = 'none';
+        }}
+      }} catch (e) {{
+        el.textContent = 'Update may have been applied. Connection lost (expected during restart).';
+      }}
+      btn.disabled = false;
+      btn.textContent = 'Install Update';
+    }}
+  </script>
+</body>
+</html>
+""".strip()
+                    self._send_html(html)
+                    return
+
+                if parsed.path == "/api/update/check":
+                    result = agent.check_for_update()
+                    self._send_json(result)
+                    return
+
+                if parsed.path == "/api/update/status":
+                    self._send_json({"ok": True, **agent.get_update_progress()})
+                    return
+
+                self._send_json({"ok": False, "error": "Not found"}, status=404)
+
+            def do_POST(self) -> None:  # noqa: N802
+                parsed = urlparse(self.path)
+                allowed_post_paths = [
+                    "/api/config",
+                    "/api/reset",
+                    "/api/reset-wifi",
+                    "/api/factory-reset",
+                    "/api/tailscale/setup",
+                    "/api/tailscale/up",
+                    "/api/tailscale/down",
+                    "/api/tailscale/logout",
+                    "/api/miner/proxy",
+                    "/api/update/apply",
+                ]
+
+                if parsed.path not in allowed_post_paths:
+                    self._send_json({"ok": False, "error": "Not found"}, status=404)
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    payload = json.loads(raw.decode("utf-8")) if raw else {}
+                    if not isinstance(payload, dict):
+                        raise ValueError("Payload must be a JSON object")
+                    if parsed.path == "/api/config":
+                        config = agent.update_runtime_config(payload)
+                        self._send_json({"ok": True, "config": config})
+                        return
+                    if parsed.path == "/api/reset":
+                        config = agent.reset_pairing()
+                        self._send_json({"ok": True, "config": config})
+                        return
+                    if parsed.path == "/api/factory-reset":
+                        result = agent.factory_reset()
+                        self._send_json(result)
+                        return
+                    if parsed.path == "/api/reset-wifi":
+                        result = agent.reset_wifi()
+                        self._send_json(result)
+                        return
+                    if parsed.path == "/api/tailscale/setup":
+                        auth_key = str(payload.get("authKey") or "")
+                        subnet_cidr = str(payload.get("subnetCIDR") or "")
+                        result = tailscale_setup.setup(auth_key=auth_key, subnet_cidr=subnet_cidr or None)
+                        if result.get("ok") and subnet_cidr.strip():
+                            with agent.config_lock:
+                                agent.user_subnet_cidr = subnet_cidr.strip()
+                                agent._persist_runtime_config()
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/tailscale/up":
+                        result = tailscale_setup.up()
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/tailscale/down":
+                        result = tailscale_setup.down()
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/tailscale/logout":
+                        result = tailscale_setup.logout()
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/update/apply":
+                        result = agent.apply_update()
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/miner/proxy":
+                        target_ip = str(payload.get("targetIp") or agent.bitaxe_host).strip()
+                        miner_path = str(payload.get("path") or "/api/system/info").strip()
+                        method = str(payload.get("method") or "GET").upper()
+                        body_data = payload.get("body")
+                        body_bytes = json.dumps(body_data).encode("utf-8") if body_data else None
+                        result = agent.proxy_miner_request(target_ip, miner_path, method=method, body=body_bytes)
+                        self._send_json(result)
+                        return
+                    self._send_json({"ok": False, "error": "Not found"}, status=404)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        class ReuseAddrHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        desired_port = self.status_http_port
+        for candidate in range(desired_port, desired_port + 10):
+            try:
+                server = ReuseAddrHTTPServer((self.status_http_bind, candidate), HubHandler)
+                self.status_http_port = candidate
+                break
+            except OSError:
+                print(f"[{now_iso()}] Port {candidate} in use, trying {candidate + 1}...", flush=True)
+        else:
+            raise RuntimeError(f"Could not bind to any port in range {desired_port}-{desired_port + 9}")
+
+        port_file = os.path.join(os.path.dirname(self.runtime_config_path), "runtime_port")
+        try:
+            with open(port_file, "w", encoding="utf-8") as pf:
+                pf.write(str(self.status_http_port))
+        except Exception as exc:
+            print(f"[{now_iso()}] Could not write port file: {exc}", flush=True)
+
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        if self.status_http_port != desired_port:
+            self._log("server", f"Port {desired_port} was in use — bound to {self.status_http_port} instead.", level="warn")
+            print(
+                f"[{now_iso()}] Port {desired_port} was in use — bound to {self.status_http_port} instead.",
+                flush=True,
+            )
+        print(
+            f"Gateway server listening on {self.status_http_bind}:{self.status_http_port} ({self.pi_hostname})",
+            flush=True,
+        )
+
+    def run(self) -> None:
+        print(
+            f"Starting gateway agent='{self.agent_id}' piHostname='{self.pi_hostname}' bitaxe='{self.bitaxe_host}' poll={self.poll_seconds}s",
+            flush=True,
+        )
+        self.start_status_server()
+
+        while True:
+            try:
+                if self.paired and self.bitaxe_host.strip():
+                    result = self.fetch_paired_miner()
+                    if result:
+                        normalized = self.normalize(result["data"])
+                        self.state.set_poll_success({"normalized": normalized, "raw": result["data"]})
+                    else:
+                        msg = f"Miner {self.bitaxe_host} unreachable"
+                        self.state.set_poll_error(msg)
+                        self._log("poll", msg, level="warn")
+            except Exception as exc:  # pylint: disable=broad-except
+                self.state.set_poll_error(str(exc))
+                self._log("poll", str(exc))
+
+            time.sleep(self.poll_seconds)
+
+
+if __name__ == "__main__":
+    HubAgent().run()

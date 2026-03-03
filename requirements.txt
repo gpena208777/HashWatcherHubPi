@@ -1,0 +1,4 @@
+requests==2.32.3
+python-dotenv==1.0.1
+bluezero==0.9.1
+dbus-python==1.4.0

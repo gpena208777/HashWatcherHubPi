@@ -1,0 +1,19 @@
+[Unit]
+Description=HashWatcher Hub Pi Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hashwatcher-hub-pi
+Group=hashwatcher-hub-pi
+WorkingDirectory=/opt/hashwatcher-hub-pi
+EnvironmentFile=/etc/hashwatcher-hub-pi/hub.env
+ExecStart=/opt/hashwatcher-hub-pi/.venv/bin/python /opt/hashwatcher-hub-pi/bitaxe_firebase_uploader.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
