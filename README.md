@@ -24,7 +24,7 @@ Follow us on [X/Twitter](https://x.com/HashWatcher).
    - **OS:** Raspberry Pi OS Lite (64-bit)
    - **Storage:** your microSD card
 4. Click the **gear icon** (or "Edit Settings") before writing and configure:
-   - Set hostname: `HashWatcherHub`
+   - Set hostname: `HashWatcherHub` (most important)
    - Enable SSH: Use password authentication
    - Set username: `pi`
    - Set password: (choose your own)
@@ -54,15 +54,19 @@ curl -fsSL https://install.hashwatcher.app | sudo bash
 
 This is the same installer used for both self-install and manual/SSH installs. It checks what is already present on the Pi and only installs what is missing, then installs or updates the hub app and services.
 
+Important: keep the hostname as `HashWatcherHub` unless you have a specific reason to change it. The `HashWatcherHub` hostname is the most important part of the default setup because the app and local dashboard URL expect it.
+
 ### Step 4: Set Up Tailscale
 
-1. Open the hub dashboard in your browser: `http://HashWatcherHub.local:8787`
-2. Follow the on-screen setup guide to connect Tailscale:
+1. Complete hub setup in the **HashWatcher app**. That is the primary setup path.
+2. In the app, finish the Tailscale step:
    - Get a free auth key from [login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys)
-   - Enter it in the dashboard
+   - Enter it in the app
    - Approve subnet routes in the [Tailscale Machines page](https://login.tailscale.com/admin/machines)
-3. Install Tailscale on your phone from [tailscale.com/download](https://tailscale.com/download)
-4. Disable key expiry (recommended) so the gateway stays connected permanently
+3. Android users without the in-app setup flow should finish setup in the browser at:
+   - `http://HashWatcherHub.local:8787`
+4. Install Tailscale on your phone from [tailscale.com/download](https://tailscale.com/download)
+5. Disable key expiry (recommended) so the gateway stays connected permanently
 
 ### Step 5: Connect the HashWatcher App
 
@@ -93,7 +97,7 @@ The installer sets up the following on your Pi:
 
 | Component | Description |
 |-----------|-------------|
-| **hashwatcher-hub-pi** service | Main agent — polls miners, serves the web dashboard and API on port 8787 |
+| **hashwatcher-hub-pi** service | Main agent — serves the web dashboard and API on port 8787 |
 | **hashwatcher-ble-provisioner** service | BLE advertising — lets the HashWatcher app discover and configure the hub over Bluetooth |
 | **Tailscale** | VPN tunnel for secure remote access (installed via official Tailscale installer) |
 | **Python virtual environment** | Isolated Python environment at `/opt/hashwatcher-hub-pi/.venv` |
@@ -103,14 +107,10 @@ The installer sets up the following on your Pi:
 
 ## What It Does
 
-- **Miner polling** — fetches hashrate, temperature, power, and efficiency from your local miners every 10 seconds
-- **Miner discovery** — scans your local subnet to find miners automatically
 - **Web dashboard** — status page with Tailscale controls and guided setup at port 8787
-- **REST API** — JSON API for the HashWatcher app
 - **BLE provisioning** — the Pi advertises as `HashWatcherHub` over Bluetooth so the app can discover it and configure Wi-Fi
 - **Built-in Tailscale** — secure remote access with subnet routing, no port forwarding needed
-- **Key expiry monitoring** — warns you when your Tailscale key is about to expire
-- **OTA updates** — optional update agent that checks for new versions automatically
+- **OTA updates** — the hub can receive improvements automatically
 
 ---
 
@@ -118,15 +118,7 @@ The installer sets up the following on your Pi:
 
 ### I already have Tailscale running on this Pi. Will the installer break it?
 
-No. The installer detects that Tailscale is already installed and skips the Tailscale installation step. It uses the existing `tailscaled` service. However, when you set up the hub through the dashboard, it will run `tailscale up` with subnet routing and the hostname `HashWatcherHub`, which will modify your existing Tailscale session. If you're already using Tailscale on this Pi for something else, the hub will add subnet route advertising to your existing connection.
-
-### What miners are supported?
-
-Any miner with an HTTP API, including:
-- **BitAxe** (all variants: Supra, Ultra, Gamma, Hex, etc.)
-- **NerdQAxe / NerdAxe**
-- **Canaan Avalon** (via CGMiner TCP protocol)
-- **Any miner** reachable via HTTP on your local network
+No. The installer detects that Tailscale is already installed and skips the Tailscale installation step. It uses the existing `tailscaled` service. When you complete hub setup, the hub configures Tailscale for the `HashWatcherHub` host and its subnet routing role.
 
 ### Can I use a Pi Zero 2 W?
 
@@ -196,65 +188,6 @@ sudo systemctl daemon-reload
 
 This does not uninstall Tailscale. To remove Tailscale: `sudo apt remove tailscale tailscaled`.
 
----
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/status` | Full gateway status (miner data, Tailscale, telemetry) |
-| GET | `/api/config` | Current runtime config |
-| POST | `/api/config` | Update miner pairing config |
-| POST | `/api/reset` | Reset miner pairing |
-| GET | `/api/discover` | Scan local subnet for miners |
-| GET | `/api/discover?cidr=192.168.1.0/24` | Scan a specific subnet |
-| GET | `/api/tailscale/status` | Tailscale connection info |
-| POST | `/api/tailscale/setup` | Connect Tailscale with auth key |
-| POST | `/api/tailscale/up` | Turn Tailscale on |
-| POST | `/api/tailscale/down` | Turn Tailscale off |
-| POST | `/api/tailscale/logout` | Disconnect and deauthorize |
-| GET | `/api/network` | Local IP and subnet info |
-| GET | `/api/miner/data` | Latest paired miner data |
-| POST | `/api/miner/proxy` | Proxy a request to any miner by IP |
-
----
-
-## BLE Provisioning
-
-The hub advertises over Bluetooth as `HashWatcherHub` so the HashWatcher app can discover it without knowing the IP address.
-
-| Property | Value |
-|----------|-------|
-| BLE device name | `HashWatcherHub` |
-| Service UUID | `A8F0C001-2D4F-4B2A-8A9E-000000000001` |
-| Wi-Fi characteristic UUID | `A8F0C001-2D4F-4B2A-8A9E-000000000002` |
-| IP status characteristic UUID | `A8F0C001-2D4F-4B2A-8A9E-000000000003` |
-| Pair status characteristic UUID | `A8F0C001-2D4F-4B2A-8A9E-000000000004` |
-| Detailed status characteristic UUID | `A8F0C001-2D4F-4B2A-8A9E-000000000005` |
-| Dedicated IP characteristic UUID | `A8F0C001-2D4F-4B2A-8A9E-000000000006` |
-
-The app sends Wi-Fi credentials over BLE, and the hub connects to the specified network using NetworkManager (`nmcli`) or `wpa_cli`.
-
----
-
-## File Layout on the Pi
-
-```
-/opt/hashwatcher-hub-pi/
-├── hashwatcher_hub_agent.py   # Main hub agent
-├── hub_ble_provisioner.py         # BLE Wi-Fi provisioner
-├── tailscale_setup.py             # Tailscale CLI wrappers
-├── requirements.txt               # Python dependencies
-├── runtime_config.json            # Miner pairing state (auto-generated)
-├── last_wifi_credentials.json     # Last Wi-Fi SSID (auto-generated)
-└── .venv/                         # Python virtual environment
-
-/etc/hashwatcher-hub-pi/
-└── hub.env                        # Environment configuration
-```
-
----
-
 ## Development
 
 ### Deploy changes to a Pi
@@ -273,5 +206,4 @@ ssh pi@HashWatcherHub.local 'sudo cp ~/hashwatcher_hub_agent.py /opt/hashwatcher
 
 ### OTA Updates
 
-Hub software updates are managed by the built-in update API in `hashwatcher_hub_agent.py`
-(`GET /api/update/check`, `POST /api/update/apply`, `GET /api/update/status`).
+Hub software updates are managed by the built-in update flow in `hashwatcher_hub_agent.py`.
