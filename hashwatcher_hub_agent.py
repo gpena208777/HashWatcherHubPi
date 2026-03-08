@@ -26,7 +26,7 @@ import hashlib
 
 import tailscale_setup
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.0.1"
 GITHUB_REPO = "gpena208777/HashWatcherHubPi"
 
 

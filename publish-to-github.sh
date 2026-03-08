@@ -13,12 +13,12 @@
 #   ./publish-to-github.sh [version]
 #
 # Example:
-#   ./publish-to-github.sh 1.0.0
+#   ./publish-to-github.sh 1.0.1
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 REPO="gpena208777/HashWatcherHubPi"
 CLONE_DIR="${SCRIPT_DIR}/_publish_clone"
 

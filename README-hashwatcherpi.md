@@ -27,8 +27,8 @@ The installer puts the hub software on the Pi. It is the same canonical installe
 Download the latest `.deb` from [Releases](https://github.com/gpena208777/HashWatcherHubPi/releases):
 
 ```bash
-wget https://github.com/gpena208777/HashWatcherHubPi/releases/latest/download/hashwatcher-hub-pi_1.0.0_all.deb
-sudo dpkg -i hashwatcher-hub-pi_1.0.0_all.deb
+wget https://github.com/gpena208777/HashWatcherHubPi/releases/latest/download/hashwatcher-hub-pi_1.0.1_all.deb
+sudo dpkg -i hashwatcher-hub-pi_1.0.1_all.deb
 ```
 
 ## After installation

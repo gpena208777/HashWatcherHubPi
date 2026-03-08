@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 PKG_NAME="hashwatcher-hub-pi"
 PKG_DIR="${SCRIPT_DIR}/_build/${PKG_NAME}_${VERSION}_all"
 
