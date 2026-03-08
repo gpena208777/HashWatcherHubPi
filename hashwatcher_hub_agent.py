@@ -992,6 +992,39 @@ netplan apply 2>/dev/null || true
             available.append(token)
         return current, available
 
+    def _infer_led_default_trigger(
+        self,
+        current_trigger: Optional[str],
+        available_triggers: List[str],
+    ) -> Optional[str]:
+        manual_triggers = {"none", "timer"}
+
+        if self._led_default_trigger and self._led_default_trigger in available_triggers:
+            return self._led_default_trigger
+
+        if current_trigger and current_trigger not in manual_triggers:
+            return current_trigger
+
+        preferred_defaults = [
+            "mmc0",
+            "actpwr",
+            "mmc1",
+            "default-on",
+            "heartbeat",
+            "cpu",
+            "cpu0",
+            "input",
+        ]
+        for trigger in preferred_defaults:
+            if trigger in available_triggers:
+                return trigger
+
+        for trigger in available_triggers:
+            if trigger not in manual_triggers:
+                return trigger
+
+        return None
+
     def _read_led_status_unlocked(self) -> Dict[str, Any]:
         led = self._detect_status_led()
         if not led:
@@ -1009,8 +1042,9 @@ netplan apply 2>/dev/null || true
 
         trigger_raw = self._read_sysfs_text(trigger_path)
         current_trigger, available_triggers = self._parse_led_trigger(trigger_raw)
-        if self._led_default_trigger is None and current_trigger:
-            self._led_default_trigger = current_trigger
+        inferred_default_trigger = self._infer_led_default_trigger(current_trigger, available_triggers)
+        if inferred_default_trigger:
+            self._led_default_trigger = inferred_default_trigger
 
         brightness = parse_int(self._read_sysfs_text(brightness_path), default=0, minimum=0)
         max_brightness = parse_int(self._read_sysfs_text(max_brightness_path), default=1, minimum=1)
@@ -1039,7 +1073,7 @@ netplan apply 2>/dev/null || true
             "brightness": brightness,
             "maxBrightness": max_brightness,
             "currentTrigger": current_trigger,
-            "defaultTrigger": self._led_default_trigger,
+            "defaultTrigger": inferred_default_trigger,
             "availableTriggers": available_triggers,
             "delayOnMs": delay_on_ms,
             "delayOffMs": delay_off_ms,
