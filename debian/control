@@ -1,0 +1,13 @@
+Package: hashwatcher-hub-pi
+Version: __VERSION__
+Section: net
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), python3-venv, bluetooth, bluez, libbluetooth-dev, network-manager, curl
+Recommends: tailscale
+Maintainer: Engineered Essentials <support@hashwatcher.app>
+Homepage: https://www.hashwatcher.app
+Description: HashWatcher Hub Pi — Raspberry Pi mining hub agent
+ Monitors BitAxe/BitDSK/NerdQ miners on the local network, provides a
+ web dashboard on port 8787, BLE Wi-Fi provisioning, and Tailscale
+ subnet routing for remote access via the HashWatcher iOS app.

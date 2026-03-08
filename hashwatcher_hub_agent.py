@@ -42,11 +42,6 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-def env_bool(name: str, default: bool) -> bool:
-    raw = env_str(name, str(default)).lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
 def parse_endpoints(raw: str) -> List[str]:
     endpoints: List[str] = []
     for item in raw.split(","):
@@ -68,6 +63,18 @@ def pick_first(data: Dict[str, Any], keys: Iterable[str]) -> Any:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_int(value: Any, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
 
 
 def to_float(value: Any) -> Optional[float]:
@@ -149,6 +156,8 @@ class HubAgent:
         self.session = requests.Session()
         self.state = HubState()
         self._update_progress: Dict[str, Any] = {"stage": "idle"}
+        self._led_lock = threading.Lock()
+        self._led_default_trigger: Optional[str] = None
 
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
@@ -347,12 +356,8 @@ class HubAgent:
             self._persist_runtime_config()
             return self.get_runtime_config()
 
-    def reset_wifi(self) -> Dict[str, Any]:
-        """Clear saved Wi-Fi credentials and disconnect Wi-Fi.
-
-        Tailscale and miner pairing are left untouched. The user will need
-        to re-provision Wi-Fi via BLE or the app.
-        """
+    def _purge_all_wifi_credentials(self) -> None:
+        """Remove Wi-Fi credentials from all common Pi network config sources."""
         wifi_creds_path = os.getenv("LAST_WIFI_PATH", "/opt/hashwatcher-hub-pi/last_wifi_credentials.json")
         try:
             if os.path.exists(wifi_creds_path):
@@ -360,41 +365,126 @@ class HubAgent:
         except Exception:
             pass
 
+        script = r"""
+set -e
+
+# Remove all known NetworkManager wireless profiles.
+nmcli -t -f NAME,TYPE connection show 2>/dev/null | while IFS=: read -r name type; do
+    if echo "$type" | grep -q wireless; then
+        nmcli connection delete "$name" 2>/dev/null || true
+    fi
+done
+
+# Clear runtime NM connection files as belt-and-suspenders.
+rm -f /run/NetworkManager/system-connections/*wlan*.nmconnection 2>/dev/null || true
+rm -f /run/NetworkManager/system-connections/*wireless*.nmconnection 2>/dev/null || true
+
+# Remove netplan files containing Wi-Fi config.
+for yf in /etc/netplan/*.yaml; do
+    [ -f "$yf" ] || continue
+    if grep -qE 'wifis:|access-points:' "$yf" 2>/dev/null; then
+        rm -f "$yf"
+    fi
+done
+
+# Strip the wifi stanza from /boot/firmware/network-config if present.
+BOOT_CFG="/boot/firmware/network-config"
+if [ -f "$BOOT_CFG" ]; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('$BOOT_CFG')
+lines = p.read_text(encoding='utf-8', errors='ignore').splitlines(keepends=True)
+out = []
+skip = False
+for line in lines:
+    stripped = line.lstrip()
+    if stripped.startswith('wifis:'):
+        skip = True
+        continue
+    if skip:
+        if line[:1] in (' ', '\t') or stripped == '':
+            continue
+        skip = False
+    out.append(line)
+p.write_text(''.join(out), encoding='utf-8')
+"
+fi
+
+# Prevent cloud-init from re-writing network config on next boot.
+mkdir -p /etc/cloud/cloud.cfg.d
+echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+
+# Disconnect wlan0 and apply netplan if available.
+nmcli device disconnect wlan0 2>/dev/null || true
+netplan apply 2>/dev/null || true
+"""
         try:
-            result = subprocess.run(
-                ["sudo", "nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
-                capture_output=True, text=True, timeout=10,
+            subprocess.run(
+                ["sudo", "bash", "-c", script],
+                capture_output=True, text=True, timeout=30,
             )
-            for line in result.stdout.strip().splitlines():
-                parts = line.rsplit(":", 1)
-                if len(parts) == 2 and "wireless" in parts[1]:
-                    conn_name = parts[0]
-                    subprocess.run(
-                        ["sudo", "nmcli", "connection", "delete", conn_name],
-                        capture_output=True, text=True, timeout=10,
-                    )
         except Exception:
             pass
 
-        try:
-            subprocess.run(["sudo", "nmcli", "device", "disconnect", "wlan0"],
-                           capture_output=True, text=True, timeout=10)
-        except Exception:
-            pass
-
-        def _delayed_restart() -> None:
-            time.sleep(2)
+    def _force_disconnect_wifi(self) -> None:
+        """Aggressively disconnect wlan0 so HTTP access drops before reboot."""
+        commands = [
+            ["sudo", "-n", "nmcli", "device", "disconnect", "wlan0"],
+            ["sudo", "-n", "wpa_cli", "-i", "wlan0", "disconnect"],
+            ["sudo", "-n", "nmcli", "radio", "wifi", "off"],
+            ["sudo", "-n", "ip", "link", "set", "wlan0", "down"],
+        ]
+        for cmd in commands:
             try:
-                subprocess.run(["sudo", "systemctl", "restart", "hashwatcher-hub-pi"],
-                               capture_output=True, text=True, timeout=15)
+                subprocess.run(cmd, capture_output=True, text=True, timeout=8)
             except Exception:
-                pass
-        threading.Thread(target=_delayed_restart, daemon=True).start()
+                continue
 
-        return {"ok": True, "message": "Wi-Fi credentials cleared. Hub will restart in ~2 seconds. Re-provision via BLE or the app."}
+    def _schedule_sudo_command(self, command: List[str], delay_seconds: float, source: str) -> None:
+        def _runner() -> None:
+            time.sleep(delay_seconds)
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "unknown error").strip()
+                    self._log(source, f"Command failed ({' '.join(command)}): {detail}", level="error")
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log(source, f"Command failed ({' '.join(command)}): {exc}", level="error")
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def reboot_hub(self) -> Dict[str, Any]:
+        self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=2, source="device-action")
+        return {
+            "ok": True,
+            "action": "reboot",
+            "message": "Hub will reboot in about 2 seconds.",
+        }
+
+    def reset_wifi(self) -> Dict[str, Any]:
+        """Clear saved Wi-Fi credentials and disconnect Wi-Fi.
+
+        Tailscale and miner pairing are left untouched.
+        """
+        self._force_disconnect_wifi()
+        self._purge_all_wifi_credentials()
+        self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=3, source="wifi-reset")
+
+        return {"ok": True, "message": "Wi-Fi disconnected and credentials cleared. Hub will reboot in ~3 seconds. Re-provision via BLE."}
+
+    def disconnect_and_reset_wifi(self) -> Dict[str, Any]:
+        """Force disconnect wlan0 immediately, then clear all Wi-Fi credentials and reboot."""
+        self._force_disconnect_wifi()
+        self._purge_all_wifi_credentials()
+        self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=2, source="wifi-reset")
+
+        return {
+            "ok": True,
+            "message": "Wi-Fi force-disconnected. Credentials cleared. Hub will reboot in ~2 seconds.",
+        }
 
     def factory_reset(self) -> Dict[str, Any]:
-        """Wipe all config, disconnect Tailscale, drop Wi-Fi, and restart the service.
+        """Wipe all config, disconnect Tailscale, drop Wi-Fi, and reboot.
 
         Mimics a fresh-from-box power-on so the full onboarding can be tested.
         """
@@ -418,72 +508,39 @@ class HubAgent:
         except Exception:
             pass
 
-        # Delete saved Wi-Fi credentials file
-        wifi_creds_path = os.getenv("LAST_WIFI_PATH", "/opt/hashwatcher-hub-pi/last_wifi_credentials.json")
-        try:
-            if os.path.exists(wifi_creds_path):
-                os.remove(wifi_creds_path)
-        except Exception:
-            pass
+        self._purge_all_wifi_credentials()
+        self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=3, source="factory-reset")
 
-        # Delete all Wi-Fi connection profiles from NetworkManager so it
-        # won't auto-reconnect.  `nmcli -t -f NAME,TYPE connection show`
-        # outputs lines like "MyNetwork:802-11-wireless".
-        try:
-            result = subprocess.run(
-                ["sudo", "nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for line in result.stdout.strip().splitlines():
-                parts = line.rsplit(":", 1)
-                if len(parts) == 2 and "wireless" in parts[1]:
-                    conn_name = parts[0]
-                    subprocess.run(
-                        ["sudo", "nmcli", "connection", "delete", conn_name],
-                        capture_output=True, text=True, timeout=10,
-                    )
-        except Exception:
-            pass
-
-        # Disconnect the Wi-Fi device as a belt-and-suspenders measure
-        try:
-            subprocess.run(["sudo", "nmcli", "device", "disconnect", "wlan0"],
-                           capture_output=True, text=True, timeout=10)
-        except Exception:
-            pass
-
-        # Also try wpa_cli for systems not using NetworkManager
-        try:
-            subprocess.run(["sudo", "wpa_cli", "-i", "wlan0", "disconnect"],
-                           capture_output=True, text=True, timeout=5)
-        except Exception:
-            pass
-
-        # Schedule a service restart so the HTTP response can be sent first
-        def _delayed_restart() -> None:
-            time.sleep(2)
-            try:
-                subprocess.run(["sudo", "systemctl", "restart", "hashwatcher-hub-pi"],
-                               capture_output=True, text=True, timeout=15)
-            except Exception:
-                pass
-        threading.Thread(target=_delayed_restart, daemon=True).start()
-
-        return {"ok": True, "message": "Factory reset complete. Wi-Fi profiles deleted. Gateway will restart in ~2 seconds."}
+        return {"ok": True, "message": "Factory reset complete. Hub will reboot in ~3 seconds."}
 
     def self_check(self) -> Dict[str, Any]:
         ts_status = tailscale_setup.status()
+        diag = tailscale_setup.diagnose()
+        usb_diag = diag.get("usbGadget", {})
+
         checks: Dict[str, Any] = {
             "wifiConnected": self._get_local_ip() is not None,
             "tailscaleAuthenticated": ts_status.get("authenticated", False),
             "tailscaleOnline": ts_status.get("online", False),
+            "tailscaleNodeNotFound": any(
+                f.get("issue") == "node_not_found" for f in diag.get("findings", [])
+            ),
+            "tailscaleKeyExpired": ts_status.get("keyExpired", False),
+            "usbGadgetUp": usb_diag.get("usb0Exists", False) and usb_diag.get("usb0HasIp", False),
+            "usbGadgetServiceActive": usb_diag.get("serviceActive", False),
         }
 
-        ok = all([
+        healthy = all([
             checks["wifiConnected"],
             checks["tailscaleAuthenticated"],
+            not checks["tailscaleNodeNotFound"],
         ])
-        return {"ok": ok, "checks": checks, "checkedAtIso": now_iso()}
+        return {
+            "ok": healthy,
+            "checks": checks,
+            "findings": diag.get("findings", []),
+            "checkedAtIso": now_iso(),
+        }
 
     def check_for_update(self) -> Dict[str, Any]:
         """Query GitHub releases API for a newer version."""
@@ -870,6 +927,170 @@ class HubAgent:
             "agentUptimeSeconds": int(time.time() - self.state.started_at),
         }
 
+    def _detect_status_led(self) -> Optional[Dict[str, str]]:
+        leds_root = "/sys/class/leds"
+        try:
+            entries = sorted(os.listdir(leds_root))
+        except Exception:
+            return None
+
+        preferred_names = ["ACT", "act", "led0"]
+        ordered: List[str] = []
+        seen = set()
+
+        for name in preferred_names:
+            if name in entries and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+
+        for name in entries:
+            lowered = name.lower()
+            if name not in seen and ("act" in lowered or lowered == "led0"):
+                ordered.append(name)
+                seen.add(name)
+
+        if not ordered:
+            return None
+
+        led_name = ordered[0]
+        return {
+            "name": led_name,
+            "dir": os.path.join(leds_root, led_name),
+        }
+
+    def _read_sysfs_text(self, path: str) -> Optional[str]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return None
+
+    def _write_sysfs_text(self, path: str, value: str) -> None:
+        result = subprocess.run(
+            ["sudo", "-n", "tee", path],
+            input=f"{value}\n",
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout).strip()
+            raise RuntimeError(stderr or f"Failed to write {path}")
+
+    def _parse_led_trigger(self, raw: Optional[str]) -> tuple[Optional[str], List[str]]:
+        if not raw:
+            return None, []
+        available: List[str] = []
+        current: Optional[str] = None
+        for part in raw.split():
+            token = part.strip()
+            if not token:
+                continue
+            if token.startswith("[") and token.endswith("]"):
+                token = token[1:-1]
+                current = token
+            available.append(token)
+        return current, available
+
+    def _read_led_status_unlocked(self) -> Dict[str, Any]:
+        led = self._detect_status_led()
+        if not led:
+            return {
+                "ok": False,
+                "supported": False,
+                "error": "Pi activity LED not detected",
+            }
+
+        brightness_path = os.path.join(led["dir"], "brightness")
+        max_brightness_path = os.path.join(led["dir"], "max_brightness")
+        trigger_path = os.path.join(led["dir"], "trigger")
+        delay_on_path = os.path.join(led["dir"], "delay_on")
+        delay_off_path = os.path.join(led["dir"], "delay_off")
+
+        trigger_raw = self._read_sysfs_text(trigger_path)
+        current_trigger, available_triggers = self._parse_led_trigger(trigger_raw)
+        if self._led_default_trigger is None and current_trigger:
+            self._led_default_trigger = current_trigger
+
+        brightness = parse_int(self._read_sysfs_text(brightness_path), default=0, minimum=0)
+        max_brightness = parse_int(self._read_sysfs_text(max_brightness_path), default=1, minimum=1)
+        delay_on_ms = parse_int(self._read_sysfs_text(delay_on_path), default=0, minimum=0)
+        delay_off_ms = parse_int(self._read_sysfs_text(delay_off_path), default=0, minimum=0)
+
+        if current_trigger == "timer":
+            mode = "blink"
+        elif current_trigger == "none":
+            mode = "on" if brightness > 0 else "off"
+        else:
+            mode = "default"
+
+        mode_label_map = {
+            "on": "On",
+            "off": "Off",
+            "blink": "Blink",
+            "default": "Default",
+        }
+
+        return {
+            "ok": True,
+            "supported": True,
+            "name": led["name"],
+            "path": led["dir"],
+            "brightness": brightness,
+            "maxBrightness": max_brightness,
+            "currentTrigger": current_trigger,
+            "defaultTrigger": self._led_default_trigger,
+            "availableTriggers": available_triggers,
+            "delayOnMs": delay_on_ms,
+            "delayOffMs": delay_off_ms,
+            "mode": mode,
+            "modeLabel": mode_label_map.get(mode, mode.title()),
+        }
+
+    def get_led_status(self) -> Dict[str, Any]:
+        with self._led_lock:
+            return self._read_led_status_unlocked()
+
+    def control_led(self, action: str, blink_on_ms: int = 250, blink_off_ms: int = 250) -> Dict[str, Any]:
+        normalized_action = action.strip().lower()
+        if normalized_action not in {"on", "off", "blink", "restore-default"}:
+            raise ValueError("action must be one of: on, off, blink, restore-default")
+
+        with self._led_lock:
+            status = self._read_led_status_unlocked()
+            if not status.get("supported"):
+                raise RuntimeError(status.get("error") or "LED control unavailable")
+
+            led_dir = status["path"]
+            brightness_path = os.path.join(led_dir, "brightness")
+            trigger_path = os.path.join(led_dir, "trigger")
+            delay_on_path = os.path.join(led_dir, "delay_on")
+            delay_off_path = os.path.join(led_dir, "delay_off")
+            max_brightness = status.get("maxBrightness") or 1
+
+            if normalized_action == "on":
+                self._write_sysfs_text(trigger_path, "none")
+                self._write_sysfs_text(brightness_path, str(max_brightness))
+            elif normalized_action == "off":
+                self._write_sysfs_text(trigger_path, "none")
+                self._write_sysfs_text(brightness_path, "0")
+            elif normalized_action == "blink":
+                available = set(status.get("availableTriggers") or [])
+                if "timer" not in available:
+                    raise RuntimeError("LED does not support the timer trigger")
+                self._write_sysfs_text(trigger_path, "timer")
+                self._write_sysfs_text(delay_on_path, str(parse_int(blink_on_ms, default=250, minimum=50, maximum=5000)))
+                self._write_sysfs_text(delay_off_path, str(parse_int(blink_off_ms, default=250, minimum=50, maximum=5000)))
+            else:
+                restore_trigger = status.get("defaultTrigger")
+                if not restore_trigger:
+                    raise RuntimeError("Default LED trigger is unknown")
+                self._write_sysfs_text(trigger_path, str(restore_trigger))
+
+            updated = self._read_led_status_unlocked()
+            updated["action"] = normalized_action
+            return updated
+
     def normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
         hashrate_ths = pick_first(data, ["hashRate", "hashRate_1m", "hashRateavg"])
         temp_c = pick_first(data, ["temp", "boardtemp", "boardTemp"])
@@ -920,7 +1141,11 @@ class HubAgent:
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (ConnectionResetError, BrokenPipeError):
+                    # Client closed the connection before we finished (e.g. app timeout, navigation). Normal; no traceback.
+                    pass
 
             def _send_html(self, body: str, status: int = 200) -> None:
                 data = body.encode("utf-8")
@@ -947,6 +1172,7 @@ class HubAgent:
                 current_step = agent.get_current_step()
                 ts_status = tailscale_setup.status()
                 wifi_status = agent.get_wifi_status()
+                led_status = agent.get_led_status()
 
                 status = {
                     "ok": True,
@@ -964,6 +1190,7 @@ class HubAgent:
                     "piTelemetry": live_pi,
                     "tailscale": ts_status,
                     "wifi": wifi_status,
+                    "statusLed": led_status,
                     "currentStep": current_step,
                     **snapshot,
                 }
@@ -989,9 +1216,13 @@ class HubAgent:
                     self._send_json(agent.self_check())
                     return
 
+                if parsed.path == "/api/diagnostics":
+                    self._send_json(tailscale_setup.diagnose())
+                    return
+
                 if parsed.path == "/api/logs":
                     query = parse_qs(parsed.query)
-                    limit = int((query.get("limit") or ["100"])[0])
+                    limit = parse_int((query.get("limit") or ["100"])[0], default=100, minimum=1, maximum=1000)
                     level_filter = (query.get("level") or [None])[0]
                     with agent._log_lock:
                         entries = list(agent._error_log)
@@ -1008,8 +1239,17 @@ class HubAgent:
                     self._send_json({"ok": True, **tailscale_setup.status()})
                     return
 
+                if parsed.path == "/api/tailscale/setup-status":
+                    self._send_json(tailscale_setup.get_setup_status())
+                    return
+
                 if parsed.path == "/api/wifi/status":
                     self._send_json({"ok": True, **agent.get_wifi_status()})
+                    return
+
+                if parsed.path == "/api/led/status":
+                    http_status = 200 if led_status.get("ok") else 503
+                    self._send_json(led_status, status=http_status)
                     return
 
                 if parsed.path == "/api/miner/data":
@@ -1048,6 +1288,18 @@ class HubAgent:
                     ts_online = ts_status.get("online", False)
                     ts_authenticated = ts_status.get("authenticated", False)
                     setup_done = wifi_ok and ts_authenticated
+                    led_supported = led_status.get("supported", False)
+                    led_name = led_status.get("name") or "ACT"
+                    led_mode_label = led_status.get("modeLabel") or "Unavailable"
+                    led_trigger = led_status.get("currentTrigger") or "-"
+                    led_default_trigger = led_status.get("defaultTrigger") or "-"
+                    led_summary = (
+                        f"{led_name} LED is in {led_mode_label.lower()} mode "
+                        f"(trigger: {led_trigger}, default: {led_default_trigger})."
+                        if led_supported
+                        else str(led_status.get("error") or "Pi activity LED control is unavailable on this device.")
+                    )
+                    led_action_status = json.dumps(led_status, indent=2) if led_supported else led_summary
 
                     soc_c = live_pi.get("socTempC")
                     soc_hot = False
@@ -1167,7 +1419,7 @@ class HubAgent:
       </a>
     </div>
 
-    {'<div class="setup-card"><h3>Finish Setup in the HashWatcher App</h3><p>Open the HashWatcher app on your iPhone to configure Wi-Fi, Tailscale, and pair your miners.</p><a class="btn" href="https://www.HashWatcher.app" target="_blank">Download Free at HashWatcher.app</a></div>' if not setup_done else ''}
+    {'<div class="setup-card"><h3>Finish Setup in the HashWatcher App</h3><p>Open the HashWatcher app on your iPhone to configure Wi-Fi, Tailscale, then you&#39;re done. No extra miner setup required. All of your existing IPs remain the same</p><a class="btn" href="https://www.HashWatcher.app" target="_blank">Download Free at HashWatcher.app</a></div>' if not setup_done else ''}
 
     <div class="card">
       <h2>Status <span class="badge {ts_badge_class}">{ts_status_label}</span></h2>
@@ -1214,14 +1466,26 @@ class HubAgent:
     </div>
 
     <div class="card">
-      <h3 style="margin:0 0 12px;">Maintenance</h3>
+      <h3 style="margin:0 0 12px;">Status LED</h3>
+      <p class="muted" id="ledStatusSummary" style="margin:0 0 12px;font-size:0.9em;">{led_summary}</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn-secondary" onclick="runSelfCheck()">Run Self-Check</button>
-        <button class="btn-warn" onclick="resetWifi()">Reset Wi-Fi</button>
-        <button class="btn-warn" onclick="factoryReset()">Factory Reset</button>
+        <button class="btn-secondary" onclick="runLedAction('on')" {'disabled' if not led_supported else ''}>Turn On</button>
+        <button class="btn-secondary" onclick="runLedAction('off')" {'disabled' if not led_supported else ''}>Turn Off</button>
+        <button class="btn-secondary" onclick="runLedAction('blink')" {'disabled' if not led_supported else ''}>Blink</button>
+        <button class="btn-secondary" onclick="runLedAction('restore-default')" {'disabled' if not led_supported else ''}>Restore Default</button>
       </div>
+      <pre id="ledActionStatus">{led_action_status}</pre>
+    </div>
+
+	    <div class="card">
+	      <h3 style="margin:0 0 12px;">Maintenance</h3>
+	      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+	        <button class="btn-secondary" onclick="runSelfCheck()">Run Self-Check</button>
+	        <button class="btn-warn" onclick="hardResetWifi()">Disconnect + Reset Wi-Fi</button>
+	        <button class="btn-warn" onclick="factoryReset()">Factory Reset</button>
+	      </div>
       <pre id="actionStatus">No actions run yet.</pre>
-      <p class="muted" style="font-size:0.8em;margin:10px 0 0;">API: <a href="/api/status">/api/status</a> &middot; <a href="/api/wifi/status">/api/wifi/status</a> &middot; <a href="/api/self-check">/api/self-check</a></p>
+      <p class="muted" style="font-size:0.8em;margin:10px 0 0;">API: <a href="/api/status">/api/status</a> &middot; <a href="/api/wifi/status">/api/wifi/status</a> &middot; <a href="/api/led/status">/api/led/status</a> &middot; <a href="/api/self-check">/api/self-check</a></p>
     </div>
 
     <div class="card">
@@ -1266,18 +1530,39 @@ class HubAgent:
       const r = await fetch('/api/self-check');
       el.textContent = JSON.stringify(await r.json(), null, 2);
     }}
-    async function resetWifi() {{
-      if (!confirm('Reset Wi-Fi\\n\\nThis will clear saved Wi-Fi credentials and disconnect Wi-Fi. Tailscale config is kept.\\n\\nContinue?')) return;
-      const el = document.getElementById('actionStatus');
-      el.textContent = 'Resetting Wi-Fi...';
+    async function runLedAction(action) {{
+      const statusEl = document.getElementById('ledActionStatus');
+      const summaryEl = document.getElementById('ledStatusSummary');
+      statusEl.textContent = 'Applying LED action: ' + action + '...';
       try {{
-        const r = await fetch('/api/reset-wifi', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+        const r = await fetch('/api/led/control', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ action }})
+        }});
         const p = await r.json();
-        el.textContent = JSON.stringify(p, null, 2);
+        statusEl.textContent = JSON.stringify(p, null, 2);
+        if (p.supported) {{
+          summaryEl.textContent = `${{p.name || 'ACT'}} LED is in ${{(p.modeLabel || 'Unknown').toLowerCase()}} mode (trigger: ${{p.currentTrigger || '-'}}, default: ${{p.defaultTrigger || '-'}}).`;
+        }} else {{
+          summaryEl.textContent = p.error || 'LED control unavailable.';
+        }}
       }} catch (e) {{
-        el.textContent = 'Wi-Fi reset sent. Connection may be lost (expected).';
+        statusEl.textContent = 'LED request failed.';
       }}
     }}
+	    async function hardResetWifi() {{
+	      if (!confirm('Disconnect + Reset Wi-Fi\\n\\nThis will force disconnect Wi-Fi now, clear saved Wi-Fi credentials, and reboot the hub. Tailscale config is kept.\\n\\nContinue?')) return;
+	      const el = document.getElementById('actionStatus');
+	      el.textContent = 'Disconnecting and resetting Wi-Fi...';
+	      try {{
+	        const r = await fetch('/api/reset-wifi-hard', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+	        const p = await r.json();
+	        el.textContent = JSON.stringify(p, null, 2);
+	      }} catch (e) {{
+	        el.textContent = 'Disconnect/reset sent. Connection loss is expected.';
+	      }}
+	    }}
     async function factoryReset() {{
       if (!confirm('Factory Reset\\n\\nThis will clear ALL config (Wi-Fi, Tailscale, pairing) and restart the hub.\\n\\nContinue?')) return;
       const el = document.getElementById('actionStatus');
@@ -1361,15 +1646,21 @@ class HubAgent:
                 parsed = urlparse(self.path)
                 allowed_post_paths = [
                     "/api/config",
+                    "/api/device/reboot",
                     "/api/reset",
                     "/api/reset-wifi",
+                    "/api/reset-wifi-hard",
                     "/api/factory-reset",
                     "/api/tailscale/setup",
                     "/api/tailscale/up",
                     "/api/tailscale/down",
                     "/api/tailscale/logout",
+                    "/api/led/control",
                     "/api/miner/proxy",
                     "/api/update/apply",
+                    "/api/repair",
+                    "/api/repair/tailscale",
+                    "/api/repair/usb-gadget",
                 ]
 
                 if parsed.path not in allowed_post_paths:
@@ -1386,6 +1677,10 @@ class HubAgent:
                         config = agent.update_runtime_config(payload)
                         self._send_json({"ok": True, "config": config})
                         return
+                    if parsed.path == "/api/device/reboot":
+                        result = agent.reboot_hub()
+                        self._send_json(result)
+                        return
                     if parsed.path == "/api/reset":
                         config = agent.reset_pairing()
                         self._send_json({"ok": True, "config": config})
@@ -1396,6 +1691,10 @@ class HubAgent:
                         return
                     if parsed.path == "/api/reset-wifi":
                         result = agent.reset_wifi()
+                        self._send_json(result)
+                        return
+                    if parsed.path == "/api/reset-wifi-hard":
+                        result = agent.disconnect_and_reset_wifi()
                         self._send_json(result)
                         return
                     if parsed.path == "/api/tailscale/setup":
@@ -1424,6 +1723,14 @@ class HubAgent:
                         http_status = 200 if result.get("ok") else 400
                         self._send_json(result, status=http_status)
                         return
+                    if parsed.path == "/api/led/control":
+                        action = str(payload.get("action") or "").strip()
+                        blink_on_ms = payload.get("blinkOnMs", 250)
+                        blink_off_ms = payload.get("blinkOffMs", 250)
+                        result = agent.control_led(action, blink_on_ms=blink_on_ms, blink_off_ms=blink_off_ms)
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
                     if parsed.path == "/api/update/apply":
                         result = agent.apply_update()
                         http_status = 200 if result.get("ok") else 400
@@ -1437,6 +1744,27 @@ class HubAgent:
                         body_bytes = json.dumps(body_data).encode("utf-8") if body_data else None
                         result = agent.proxy_miner_request(target_ip, miner_path, method=method, body=body_bytes)
                         self._send_json(result)
+                        return
+                    if parsed.path == "/api/repair":
+                        auth_key = str(payload.get("authKey") or "")
+                        ts_result = tailscale_setup.repair_tailscale(auth_key=auth_key or None)
+                        usb_result = tailscale_setup.repair_usb_gadget()
+                        self._send_json({
+                            "ok": ts_result.get("ok", False) and usb_result.get("ok", False),
+                            "tailscale": ts_result,
+                            "usbGadget": usb_result,
+                        })
+                        return
+                    if parsed.path == "/api/repair/tailscale":
+                        auth_key = str(payload.get("authKey") or "")
+                        result = tailscale_setup.repair_tailscale(auth_key=auth_key or None)
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/repair/usb-gadget":
+                        result = tailscale_setup.repair_usb_gadget()
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
                         return
                     self._send_json({"ok": False, "error": "Not found"}, status=404)
                 except Exception as exc:  # pylint: disable=broad-except
@@ -1476,12 +1804,50 @@ class HubAgent:
             flush=True,
         )
 
+    def _self_heal_loop(self) -> None:
+        """Background loop that periodically checks health and auto-repairs what it can.
+
+        Runs every 60s. Auto-repairs USB gadget issues (no user input needed).
+        Logs Tailscale issues but can't auto-fix without an auth key.
+        """
+        HEAL_INTERVAL = 60
+        time.sleep(30)  # let services settle after boot
+        while True:
+            try:
+                diag = tailscale_setup.diagnose()
+                if diag.get("healthy"):
+                    time.sleep(HEAL_INTERVAL)
+                    continue
+
+                for finding in diag.get("findings", []):
+                    component = finding.get("component", "")
+                    issue = finding.get("issue", "")
+                    repairable = finding.get("autoRepairable", False)
+
+                    if component == "usb_gadget" and repairable:
+                        self._log("self-heal", f"Auto-repairing USB gadget: {issue}", level="info")
+                        result = tailscale_setup.repair_usb_gadget()
+                        if result.get("ok"):
+                            self._log("self-heal", f"USB gadget repair succeeded: {result.get('actionsTaken', [])}", level="info")
+                        else:
+                            self._log("self-heal", f"USB gadget repair had errors: {result.get('errors', [])}", level="warn")
+
+                    elif component == "tailscale":
+                        self._log("self-heal", f"Tailscale issue detected: {issue} — {finding.get('message', '')}", level="warn")
+
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log("self-heal", f"Self-heal loop error: {exc}")
+
+            time.sleep(HEAL_INTERVAL)
+
     def run(self) -> None:
         print(
             f"Starting gateway agent='{self.agent_id}' piHostname='{self.pi_hostname}' bitaxe='{self.bitaxe_host}' poll={self.poll_seconds}s",
             flush=True,
         )
         self.start_status_server()
+
+        threading.Thread(target=self._self_heal_loop, daemon=True, name="self-heal").start()
 
         while True:
             try:

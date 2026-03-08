@@ -1,0 +1,13 @@
+[Unit]
+Description=Bring up USB gadget ethernet (usb0) with fixed link-local IP
+After=network-pre.target
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip link set usb0 up 2>/dev/null; ip addr add 169.254.75.1/16 dev usb0 2>/dev/null || true'
+ExecStop=/bin/sh -c 'ip addr flush dev usb0 2>/dev/null; ip link set usb0 down 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

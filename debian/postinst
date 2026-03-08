@@ -1,0 +1,67 @@
+#!/bin/bash
+set -e
+
+INSTALL_DIR="/opt/hashwatcher-hub-pi"
+CONFIG_DIR="/etc/hashwatcher-hub-pi"
+SERVICE_USER="hashwatcher-hub-pi"
+VENV_DIR="${INSTALL_DIR}/.venv"
+REQ_HASH_FILE="${INSTALL_DIR}/.requirements.sha256"
+
+# Create service user if missing
+if ! id "${SERVICE_USER}" &>/dev/null; then
+    useradd -r -m -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
+fi
+
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+    python3 -m venv "${VENV_DIR}"
+fi
+
+CURRENT_REQ_HASH="$(sha256sum "${INSTALL_DIR}/requirements.txt" | awk '{print $1}')"
+SAVED_REQ_HASH="$(cat "${REQ_HASH_FILE}" 2>/dev/null || true)"
+
+if [[ "${CURRENT_REQ_HASH}" != "${SAVED_REQ_HASH}" ]]; then
+    "${VENV_DIR}/bin/pip" install --upgrade pip -q 2>/dev/null
+    "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q 2>/dev/null
+    printf '%s\n' "${CURRENT_REQ_HASH}" > "${REQ_HASH_FILE}"
+fi
+
+# Install Tailscale if not present
+if ! command -v tailscale &>/dev/null; then
+    echo "[HashWatcher] Installing Tailscale..."
+    curl -fsSL https://tailscale.com/install.sh | sh
+fi
+systemctl enable tailscaled --now 2>/dev/null || true
+
+# IP forwarding for subnet routing
+cat > /etc/sysctl.d/99-tailscale.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
+sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null 2>&1 || true
+
+# Sudoers for the service user (Tailscale, nmcli, systemctl)
+cat > /etc/sudoers.d/hashwatcher-hub-pi <<'SUDOERS'
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tailscale, /usr/bin/tailscale up *, /usr/bin/tailscale down, /usr/bin/tailscale logout, /usr/bin/tailscale status *, /usr/bin/tailscale debug *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemctl start tailscaled, /usr/bin/systemctl restart tailscaled, /usr/bin/systemctl restart hashwatcher-hub-pi, /usr/bin/systemctl restart hashwatcher-ble-provisioner
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/reboot
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/sysctl -w *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
+SUDOERS
+chmod 0440 /etc/sudoers.d/hashwatcher-hub-pi
+
+# Fix ownership
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" "${CONFIG_DIR}"
+
+# Reload and start services
+systemctl daemon-reload
+systemctl enable --now hashwatcher-hub-pi
+systemctl enable --now hashwatcher-ble-provisioner
+
+echo ""
+echo "[HashWatcher] Hub Pi installed successfully!"
+echo "[HashWatcher] Dashboard:  http://$(hostname).local:8787"
+echo "[HashWatcher] Next: open the HashWatcher app to pair your miners."
+echo ""

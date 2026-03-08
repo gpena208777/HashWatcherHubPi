@@ -1,44 +1,28 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-# HashWatcher Hub Pi — One-Command Installer for Raspberry Pi
+# HashWatcher Hub Pi — canonical installer for stock Raspberry Pi OS.
 #
-# SETUP GUIDE FOR CUSTOMERS:
+# Default mode:
+#   Downloads the latest app payload from GitHub and installs it.
 #
-#   1. Download Raspberry Pi Imager from https://www.raspberrypi.com/software/
-#   2. Insert your microSD card into your computer
-#   3. Open Raspberry Pi Imager and choose:
-#        - Device:  your Pi model (Pi 4 / Pi 5)
-#        - OS:      Raspberry Pi OS Lite (64-bit)
-#        - Storage: your microSD card
-#   4. Click the GEAR icon (⚙) before writing and configure:
-#        ✅ Set hostname:     HashWatcherHub
-#        ✅ Enable SSH:       Use password authentication
-#        ✅ Set username:     pi
-#        ✅ Set password:     (choose your own)
-#        ✅ Configure Wi-Fi:  enter your SSID and password
-#        ✅ Set locale:       your timezone
-#   5. Click WRITE and wait for it to finish
-#   6. Insert the SD card into your Pi and power it on
-#   7. Wait ~60 seconds for it to boot and connect to Wi-Fi
-#   8. From your computer (on the same network), run:
-#
-#        ssh pi@HashWatcherHub.local
-#        curl -fsSL https://raw.githubusercontent.com/gpena208777/HashWatcherHubPi/main/install.sh | sudo bash
-#
-#     Or if you've set up install.hashwatcher.app:
-#        curl -fsSL https://install.hashwatcher.app | sudo bash
-#
+# Local mode:
+#   Installs from a local source directory. Used by SSH/manual deploys.
+#   Example: sudo bash install.sh --source-dir /tmp/hashwatcher
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 REPO="gpena208777/HashWatcherHubPi"
 BRANCH="main"
-RELEASE_TAG="latest"
+RELEASE_URL="https://github.com/${REPO}/releases/latest/download/hashwatcher-hub-pi.tar.gz"
+ARCHIVE_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+
 INSTALL_DIR="/opt/hashwatcher-hub-pi"
 CONFIG_DIR="/etc/hashwatcher-hub-pi"
+SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_USER="hashwatcher-hub-pi"
-HOSTNAME_TARGET="HashWatcherHub"
 VENV_DIR="${INSTALL_DIR}/.venv"
+REQ_HASH_FILE="${INSTALL_DIR}/.requirements.sha256"
+SOURCE_DIR=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,228 +34,223 @@ info()  { echo -e "${CYAN}[HashWatcher]${NC} $*"; }
 ok()    { echo -e "${GREEN}[HashWatcher]${NC} $*"; }
 fail()  { echo -e "${RED}[HashWatcher]${NC} $*" >&2; exit 1; }
 
-# ── Pre-flight checks ───────────────────────────────────────────────
+required_files=(
+    hashwatcher_hub_agent.py
+    hub_ble_provisioner.py
+    tailscale_setup.py
+    requirements.txt
+    hashwatcher-hub.service
+    hashwatcher-ble-provisioner.service
+    hub.env.prepared
+)
 
-[[ "$(uname -s)" == "Linux" ]] || fail "This installer is for Linux (Raspberry Pi OS)."
-[[ "$(id -u)" -eq 0 ]] || fail "Please run as root:  curl -fsSL https://install.hashwatcher.app | sudo bash"
+required_packages=(
+    python3
+    python3-venv
+    python3-pip
+    python3-dev
+    python3-dbus
+    bluetooth
+    bluez
+    libbluetooth-dev
+    libglib2.0-dev
+    libdbus-1-dev
+    libcairo2-dev
+    libgirepository1.0-dev
+    gobject-introspection
+    pkg-config
+    meson
+    wireless-tools
+    wpasupplicant
+    network-manager
+    curl
+)
 
-info "${BOLD}HashWatcher Hub Pi Installer${NC}"
-info "This will install the HashWatcher Hub Pi agent on this Raspberry Pi."
-echo ""
+usage() {
+    cat <<'EOF'
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/gpena208777/HashWatcherHubPi/main/install.sh | sudo bash
+  sudo bash install.sh --source-dir /path/to/hashwatcher-bundle
+EOF
+}
 
-# ── System packages ──────────────────────────────────────────────────
+package_installed() {
+    dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx "installed"
+}
 
-info "Updating system packages..."
-apt-get update -qq
-apt-get install -y -qq \
-    python3 python3-venv python3-pip \
-    bluetooth bluez libbluetooth-dev \
-    wireless-tools wpasupplicant network-manager \
-    curl wget git jq >/dev/null 2>&1
+append_config_if_missing() {
+    local key="$1"
+    local value="$2"
+    local config_path="${CONFIG_DIR}/hub.env"
 
-# ── Install Tailscale ────────────────────────────────────────────────
+    if ! grep -q "^${key}=" "${config_path}"; then
+        printf '\n%s=%s\n' "${key}" "${value}" >> "${config_path}"
+    fi
+}
 
-if ! command -v tailscale &>/dev/null; then
-    info "Installing Tailscale..."
-    curl -fsSL https://tailscale.com/install.sh | sh
-else
-    ok "Tailscale already installed."
-fi
-systemctl enable tailscaled --now 2>/dev/null || true
+install_from_source() {
+    local src="$1"
+    local current_hostname
+    local current_req_hash
+    local saved_req_hash
+    local venv_created=0
+    local missing_packages=()
 
-# ── Enable IP forwarding ────────────────────────────────────────────
+    for f in "${required_files[@]}"; do
+        [[ -f "${src}/${f}" ]] || fail "Missing required installer asset: ${src}/${f}"
+    done
 
-info "Enabling IP forwarding for subnet routing..."
-cat > /etc/sysctl.d/99-tailscale.conf <<'EOF'
+    info "${BOLD}HashWatcher Hub Pi Installer${NC}"
+    info "Installing from source: ${src}"
+    echo ""
+
+    for pkg in "${required_packages[@]}"; do
+        if ! package_installed "${pkg}"; then
+            missing_packages+=("${pkg}")
+        fi
+    done
+
+    if ((${#missing_packages[@]} > 0)); then
+        info "Installing missing system packages: ${missing_packages[*]}"
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing_packages[@]}"
+    else
+        ok "Required system packages already installed."
+    fi
+
+    if ! command -v tailscale >/dev/null 2>&1; then
+        info "Installing Tailscale..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    else
+        ok "Tailscale already installed."
+    fi
+
+    if systemctl list-unit-files tailscaled.service >/dev/null 2>&1; then
+        systemctl enable tailscaled --now 2>/dev/null || true
+    fi
+
+    cat > /etc/sysctl.d/99-tailscale.conf <<'EOF'
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null 2>&1 || true
+    sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null 2>&1 || true
 
-# ── Set hostname ─────────────────────────────────────────────────────
+    if ! id "${SERVICE_USER}" &>/dev/null; then
+        info "Creating service user: ${SERVICE_USER}"
+        useradd -r -m -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
+    fi
 
-info "Setting hostname to ${HOSTNAME_TARGET}..."
-hostnamectl set-hostname "${HOSTNAME_TARGET}" 2>/dev/null || true
-echo "${HOSTNAME_TARGET}" > /etc/hostname
+    install -d -m 0755 "${INSTALL_DIR}" "${CONFIG_DIR}" "${INSTALL_DIR}/updates"
 
-# ── Create service user ──────────────────────────────────────────────
+    for f in hashwatcher_hub_agent.py hub_ble_provisioner.py tailscale_setup.py requirements.txt; do
+        install -m 0644 "${src}/${f}" "${INSTALL_DIR}/${f}"
+    done
 
-if ! id "${SERVICE_USER}" &>/dev/null; then
-    info "Creating service user: ${SERVICE_USER}"
-    useradd -r -m -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
-fi
+    if [[ -f "${src}/icon.png" ]]; then
+        install -m 0644 "${src}/icon.png" "${INSTALL_DIR}/icon.png"
+    fi
 
-mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}"
+    install -m 0644 "${src}/hashwatcher-hub.service" "${SYSTEMD_DIR}/hashwatcher-hub-pi.service"
+    install -m 0644 "${src}/hashwatcher-ble-provisioner.service" "${SYSTEMD_DIR}/hashwatcher-ble-provisioner.service"
 
-# ── Download gateway files ────────────────────────────────────────────
+    if [[ ! -f "${CONFIG_DIR}/hub.env" ]]; then
+        info "Writing default configuration..."
+        install -m 0644 "${src}/hub.env.prepared" "${CONFIG_DIR}/hub.env"
+        current_hostname="$(hostname)"
+        sed -i "s/^PI_HOSTNAME=.*/PI_HOSTNAME=${current_hostname}/" "${CONFIG_DIR}/hub.env"
+        sed -i "s/^AGENT_ID=.*/AGENT_ID=${current_hostname}/" "${CONFIG_DIR}/hub.env"
+    else
+        ok "Existing configuration preserved at ${CONFIG_DIR}/hub.env"
+    fi
 
-info "Downloading HashWatcher Gateway files..."
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
+    append_config_if_missing "RUNTIME_CONFIG_PATH" "${INSTALL_DIR}/runtime_config.json"
+    append_config_if_missing "LAST_WIFI_PATH" "${INSTALL_DIR}/last_wifi_credentials.json"
 
-# Try .deb from GitHub Release first (cleanest install), fall back to tarball
-# Resolve latest release .deb via API (GitHub redirects don't work for parameterized asset names)
-DEB_URL=""
-if [[ "${RELEASE_TAG}" == "latest" ]]; then
-    DEB_INFO="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | jq -r '.assets[] | select(.name | endswith(".deb")) | .browser_download_url' 2>/dev/null | head -1)"
-    [[ -n "${DEB_INFO}" ]] && DEB_URL="${DEB_INFO}"
-else
-    DEB_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/hashwatcher-hub-pi_${RELEASE_TAG#v}_all.deb"
-fi
-RELEASE_URL="https://github.com/${REPO}/releases/${RELEASE_TAG}/download/hashwatcher-hub-pi.tar.gz"
-ARCHIVE_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+    current_req_hash="$(sha256sum "${INSTALL_DIR}/requirements.txt" | awk '{print $1}')"
+    saved_req_hash="$(cat "${REQ_HASH_FILE}" 2>/dev/null || true)"
 
-if [[ -n "${DEB_URL}" ]] && curl -fsSL --head "${DEB_URL}" >/dev/null 2>&1; then
-    info "Installing from .deb package..."
-    DEB_PATH="${TMP_DIR}/hashwatcher-hub-pi.deb"
-    curl -fsSL -o "${DEB_PATH}" "${DEB_URL}"
-    dpkg -i "${DEB_PATH}"
-    ok "Installed via .deb package."
-    echo ""
-    ok "Dashboard:  http://$(hostname).local:8787"
-    ok "Next: open the HashWatcher app to pair your miners."
-    exit 0
-fi
+    if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+        info "Creating Python virtual environment..."
+        python3 -m venv "${VENV_DIR}"
+        venv_created=1
+    fi
 
-if curl -fsSL --head "${RELEASE_URL}" >/dev/null 2>&1; then
-    info "Downloading from release tarball..."
-    curl -fsSL "${RELEASE_URL}" | tar -xz -C "${TMP_DIR}"
-    PI_SRC="${TMP_DIR}"
-else
-    info "Downloading from repository..."
-    curl -fsSL "${ARCHIVE_URL}" | tar -xz -C "${TMP_DIR}" --strip-components=1
-    PI_SRC="${TMP_DIR}"
-fi
+    if [[ "${current_req_hash}" != "${saved_req_hash}" || "${venv_created}" -eq 1 ]]; then
+        info "Installing Python dependencies..."
+        "${VENV_DIR}/bin/pip" install --upgrade pip -q
+        "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
+        printf '%s\n' "${current_req_hash}" > "${REQ_HASH_FILE}"
+    else
+        ok "Python dependencies unchanged; reusing existing virtualenv."
+    fi
 
-if [[ ! -f "${PI_SRC}/bitaxe_firebase_uploader.py" ]]; then
-    fail "Hub Pi agent files not found in the downloaded archive. Check the repo or release."
-fi
-
-# ── Install Python files ─────────────────────────────────────────────
-
-info "Installing Hub Pi agent..."
-cp "${PI_SRC}/bitaxe_firebase_uploader.py" "${INSTALL_DIR}/"
-cp "${PI_SRC}/hub_ble_provisioner.py"      "${INSTALL_DIR}/"
-cp "${PI_SRC}/tailscale_setup.py"          "${INSTALL_DIR}/"
-cp "${PI_SRC}/requirements.txt"            "${INSTALL_DIR}/"
-cp "${PI_SRC}/icon.png"                    "${INSTALL_DIR}/" 2>/dev/null || true
-
-# ── Python virtual environment ───────────────────────────────────────
-
-info "Setting up Python environment..."
-python3 -m venv "${VENV_DIR}"
-"${VENV_DIR}/bin/pip" install --upgrade pip -q
-"${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
-
-# ── Configuration ────────────────────────────────────────────────────
-
-if [[ ! -f "${CONFIG_DIR}/hub.env" ]]; then
-    info "Writing default configuration..."
-    cat > "${CONFIG_DIR}/hub.env" <<EOF
-PI_HOSTNAME=${HOSTNAME_TARGET}
-BITAXE_HOST=
-BITAXE_SCHEME=http
-BITAXE_ENDPOINTS=/system/info,/api/system/info
-POLL_SECONDS=10
-HTTP_TIMEOUT_SECONDS=5
-STATUS_HTTP_BIND=0.0.0.0
-STATUS_HTTP_PORT=8787
-RUNTIME_CONFIG_PATH=${INSTALL_DIR}/runtime_config.json
-LAST_WIFI_PATH=${INSTALL_DIR}/last_wifi_credentials.json
-AGENT_ID=${HOSTNAME_TARGET}
-EOF
-else
-    ok "Existing configuration preserved at ${CONFIG_DIR}/hub.env"
-fi
-
-# ── Systemd services ────────────────────────────────────────────────
-
-info "Installing systemd services..."
-
-cat > /etc/systemd/system/hashwatcher-hub-pi.service <<EOF
-[Unit]
-Description=HashWatcher Hub Pi Agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_USER}
-WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=${CONFIG_DIR}/hub.env
-ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/bitaxe_firebase_uploader.py
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/hashwatcher-ble-provisioner.service <<EOF
-[Unit]
-Description=HashWatcher BLE Wi-Fi Provisioner
-After=bluetooth.service network-pre.target
-Wants=bluetooth.service
-
-[Service]
-Type=simple
-User=root
-Group=root
-WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=-${CONFIG_DIR}/hub.env
-ExecStartPre=/bin/sleep 2
-ExecStartPre=/usr/sbin/rfkill unblock bluetooth
-ExecStartPre=/bin/sleep 1
-ExecStartPre=/usr/bin/hciconfig hci0 up
-ExecStartPre=/bin/sleep 1
-ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/hub_ble_provisioner.py
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# ── Sudoers for service user ─────────────────────────────────────────
-
-cat > /etc/sudoers.d/hashwatcher-hub-pi <<'EOF'
+    cat > /etc/sudoers.d/hashwatcher-hub-pi <<'EOF'
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tailscale, /usr/bin/tailscale up *, /usr/bin/tailscale down, /usr/bin/tailscale logout, /usr/bin/tailscale status *, /usr/bin/tailscale debug *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemctl start tailscaled, /usr/bin/systemctl restart tailscaled, /usr/bin/systemctl restart hashwatcher-hub-pi, /usr/bin/systemctl restart hashwatcher-ble-provisioner
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/reboot
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/sysctl -w *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
 EOF
-chmod 0440 /etc/sudoers.d/hashwatcher-hub-pi
+    chmod 0440 /etc/sudoers.d/hashwatcher-hub-pi
 
-# ── Set ownership & start ────────────────────────────────────────────
+    chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" "${CONFIG_DIR}"
 
-chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" "${CONFIG_DIR}"
+    systemctl daemon-reload
+    systemctl enable hashwatcher-hub-pi >/dev/null 2>&1 || true
+    systemctl enable hashwatcher-ble-provisioner >/dev/null 2>&1 || true
+    systemctl restart hashwatcher-hub-pi
+    systemctl restart hashwatcher-ble-provisioner
 
-systemctl daemon-reload
-systemctl enable --now hashwatcher-hub-pi
-systemctl enable --now hashwatcher-ble-provisioner
+    echo ""
+    ok "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ok "${BOLD}HashWatcher Hub Pi installed successfully!${NC}"
+    ok "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ok "Dashboard:  http://$(hostname).local:8787"
+    ok "API:        http://$(hostname).local:8787/api/status"
+    echo ""
+}
 
-# ── Done ─────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source-dir)
+            [[ $# -ge 2 ]] || fail "--source-dir requires a path"
+            SOURCE_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "Unknown argument: $1"
+            ;;
+    esac
+done
 
+[[ "$(uname -s)" == "Linux" ]] || fail "This installer is for Linux (Raspberry Pi OS)."
+[[ "$(id -u)" -eq 0 ]] || fail "Please run as root."
+
+if [[ -n "${SOURCE_DIR}" ]]; then
+    install_from_source "${SOURCE_DIR}"
+    exit 0
+fi
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+info "${BOLD}HashWatcher Hub Pi Bootstrap Installer${NC}"
+info "This will download the latest HashWatcher Hub Pi payload and install it on this Raspberry Pi."
 echo ""
-ok "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ok "${BOLD}HashWatcher Hub Pi installed successfully!${NC}"
-ok "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-ok "Dashboard:  http://${HOSTNAME_TARGET}.local:8787"
-ok "API:        http://${HOSTNAME_TARGET}.local:8787/api/status"
-echo ""
-ok "Next steps:"
-ok "  1. Download the HashWatcher app at https://www.HashWatcher.app"
-ok "  2. Open the dashboard above to set up Tailscale"
-ok "  3. Pair your miners from the app"
-echo ""
-ok "Logs:  journalctl -u hashwatcher-hub-pi -f"
-ok "BLE:   journalctl -u hashwatcher-ble-provisioner -f"
-echo ""
+info "Downloading HashWatcher Gateway files..."
+
+if curl -fsSL "${RELEASE_URL}" | tar -xz -C "${TMP_DIR}" 2>/dev/null; then
+    info "Downloaded latest release bundle."
+else
+    info "Falling back to repository archive."
+    curl -fsSL "${ARCHIVE_URL}" | tar -xz -C "${TMP_DIR}" --strip-components=1
+fi
+
+install_from_source "${TMP_DIR}"

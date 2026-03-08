@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -rf /opt/hashwatcher-hub-pi/.venv
+    rm -rf /opt/hashwatcher-hub-pi/updates
+    rm -f /etc/sudoers.d/hashwatcher-hub-pi
+    rm -f /etc/sysctl.d/99-tailscale.conf
+    userdel hashwatcher-hub-pi 2>/dev/null || true
+    systemctl daemon-reload
+fi

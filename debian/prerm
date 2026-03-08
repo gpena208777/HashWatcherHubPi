@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Stop services before removal
+systemctl stop hashwatcher-hub-pi 2>/dev/null || true
+systemctl stop hashwatcher-ble-provisioner 2>/dev/null || true
+systemctl disable hashwatcher-hub-pi 2>/dev/null || true
+systemctl disable hashwatcher-ble-provisioner 2>/dev/null || true
