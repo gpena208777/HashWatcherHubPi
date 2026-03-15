@@ -1,6 +1,8 @@
-# HashWatcher Hub Pi
+# HashWatcher Hub
 
 Turn a Raspberry Pi into a dedicated mining hub that monitors your ASIC rigs and makes them accessible from anywhere via Tailscale. Pair it with the free [HashWatcher app](https://www.HashWatcher.app) for iOS, macOS, and Android.
+
+Join our Discord https://discord.gg/Xu66PvpAm
 
 Follow us on [X/Twitter](https://x.com/HashWatcher).
 
