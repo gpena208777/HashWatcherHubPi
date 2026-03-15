@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PI_HOST="${1:-raspberrypi.local}"
-PI_USER="${2:-pi}"
+PI_USER="${2:-hashwatcherhub}"
 PI_TARGET="${PI_USER}@${PI_HOST}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUDO_PASS="${PI_SUDO_PASS:-${SSHPASS:-}}"

@@ -11,11 +11,11 @@ Turn any Raspberry Pi into a Tailscale-enabled HashWatcher hub with local setup 
 
 ## Quick Install
 
-Flash **Raspberry Pi OS Lite (64-bit)** onto your Pi using [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Configure hostname `HashWatcherHub`, enable SSH, and set your user/password. The `HashWatcherHub` hostname is the most important part and should stay `HashWatcherHub` unless you have a specific reason to change it. Then:
+Flash **Raspberry Pi OS Lite (64-bit)** onto your Pi using [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Configure hostname `HashWatcherHub`, enable SSH, set username `hashwatcherhub`, and set password `90218`. The `HashWatcherHub` hostname is the most important part and should stay `HashWatcherHub` unless you have a specific reason to change it. Then:
 
 ```bash
-ssh pi@HashWatcherHub.local
-# Or, for pre-configured images: ssh hashwatcherhub@HashWatcherHub.local (password: 90218)
+ssh hashwatcherhub@HashWatcherHub.local
+# Password: 90218
 
 curl -fsSL https://raw.githubusercontent.com/gpena208777/HashWatcherHubPi/main/install.sh | sudo bash
 ```

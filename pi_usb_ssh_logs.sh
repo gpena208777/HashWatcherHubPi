@@ -8,13 +8,13 @@
 #
 # You can also pass the BLE-reported IP directly (e.g. 192.168.0.53):
 #   ./pi_usb_ssh_logs.sh 192.168.0.53
-#   ./pi_usb_ssh_logs.sh 192.168.0.53 pi
+#   ./pi_usb_ssh_logs.sh 192.168.0.53 hashwatcherhub
 #   ./pi_usb_ssh_logs.sh                     # auto-detect (USB gadget → mDNS → ARP)
 
 set -euo pipefail
 
 PI_HOST="${1:-}"
-PI_USER="${2:-pi}"
+PI_USER="${2:-hashwatcherhub}"
 
 USB_GADGET_IPS=(
   169.254.75.1

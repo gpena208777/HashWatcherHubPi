@@ -16,13 +16,13 @@
 #   ./install_to_pi_usb.sh                          # auto-detect
 #   ./install_to_pi_usb.sh 192.168.0.53             # BLE-reported LAN IP
 #   ./install_to_pi_usb.sh 169.254.75.1             # explicit USB gadget IP
-#   ./install_to_pi_usb.sh 192.168.0.53 pi          # IP and username
+#   ./install_to_pi_usb.sh 192.168.0.53 hashwatcherhub  # IP and username
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PI_HOST="${1:-}"
-PI_USER="${2:-HashWatcherHub}"
+PI_USER="${2:-hashwatcherhub}"
 
 SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 

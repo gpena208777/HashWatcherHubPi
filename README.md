@@ -28,8 +28,8 @@ Follow us on [X/Twitter](https://x.com/HashWatcher).
 4. Click the **gear icon** (or "Edit Settings") before writing and configure:
    - Set hostname: `HashWatcherHub` (most important)
    - Enable SSH: Use password authentication
-   - Set username: `pi`
-   - Set password: (choose your own)
+   - Set username: `hashwatcherhub`
+   - Set password: `90218`
    - Configure Wi-Fi: enter your SSID and password
    - Set locale: your timezone
 5. Click **Write** and wait for it to finish
@@ -45,7 +45,7 @@ Follow us on [X/Twitter](https://x.com/HashWatcher).
 From your computer (on the same network), open a terminal and run:
 
 ```bash
-ssh pi@HashWatcherHub.local
+ssh hashwatcherhub@HashWatcherHub.local
 ```
 
 Enter the password you set in Step 1. Then run the canonical installer:
@@ -135,13 +135,13 @@ No. Tailscale creates an encrypted peer-to-peer tunnel. No port forwarding or dy
 SSH into the Pi and re-run the installer. It preserves your existing config:
 
 ```bash
-ssh pi@HashWatcherHub.local
+ssh hashwatcherhub@HashWatcherHub.local
 curl -fsSL https://install.hashwatcher.app | sudo bash
 ```
 
 ### How do I check the logs?
 
-SSH into the Pi using the hostname (mDNS) or the IP you got from BLE/onboarding (use the username you set in Imager):
+SSH into the Pi using the hostname (mDNS) or the IP you got from BLE/onboarding:
 
 ```bash
 # By hostname (same network)
@@ -196,14 +196,14 @@ This does not uninstall Tailscale. To remove Tailscale: `sudo apt remove tailsca
 
 ```bash
 cd pi-agent
-./install_to_pi.sh 192.168.0.51 pi
+./install_to_pi.sh 192.168.0.51 hashwatcherhub
 ```
 
 ### Quick file-only update (no full reinstall)
 
 ```bash
-scp pi-agent/hashwatcher_hub_agent.py pi@HashWatcherHubPi.local:~/
-ssh pi@HashWatcherHub.local 'sudo cp ~/hashwatcher_hub_agent.py /opt/hashwatcher-hub-pi/ && sudo systemctl restart hashwatcher-hub-pi'
+scp pi-agent/hashwatcher_hub_agent.py hashwatcherhub@HashWatcherHub.local:~/
+ssh hashwatcherhub@HashWatcherHub.local 'sudo cp ~/hashwatcher_hub_agent.py /opt/hashwatcher-hub-pi/ && sudo systemctl restart hashwatcher-hub-pi'
 ```
 
 ### OTA Updates
