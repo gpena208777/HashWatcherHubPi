@@ -190,6 +190,28 @@ sudo systemctl daemon-reload
 
 This does not uninstall Tailscale. To remove Tailscale: `sudo apt remove tailscale tailscaled`.
 
+### Stalled at Step 3 (Connecting to Tailscale)
+
+If you are setting up the Hub via the **HashWatcher App** and the process stalls while connecting to **Tailscale**, follow these steps to reset the connection state on your Raspberry Pi.
+
+### Instructions
+
+1.  **Open Terminal:** On your PC or laptop, open the **Command Prompt** (Windows) or **Terminal** (macOS/Linux). 
+    * *Note: On Windows, it is recommended to run Command Prompt as an Administrator.*
+2.  **Run the Reset Command:** Copy and paste the command below. Replace `<PI_IP>` with the actual IP address of your Raspberry Pi.
+
+```bash
+ssh hashwatcherhub@<PI_IP> "sudo tailscale down; sudo tailscale logout; sudo systemctl restart tailscaled; sudo rm -f /opt/hashwatcher-hub-pi/runtime_config.json /opt/hashwatcher-hub-pi/last_wifi_credentials.json; sudo systemctl restart hashwatcher-hub-pi hashwatcher-ble-provisioner; tailscale status"
+```
+3.  **Restart the App:** Once the command finishes, **close and restart the HashWatcher App** on your mobile device to ensure a fresh start for the provisioning process.
+
+### What this command does:
+* **Resets Tailscale:** Forces a logout and restarts the Tailscale daemon to clear hung sessions.
+* **Clears Configs:** Removes temporary runtime and WiFi credentials to allow a fresh provisioning attempt.
+* **Restarts Services:** Reboots the HashWatcher Hub and BLE provisioner services.
+* **Status Check:** Displays the final Tailscale status so you can verify the connection.
+
+
 ## Development
 
 ### Deploy changes to a Pi
