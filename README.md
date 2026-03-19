@@ -7,6 +7,11 @@ Join our Discord https://discord.gg/Xu66PvpAm
 Follow us on [X/Twitter](https://x.com/HashWatcher).
 
 ---
+## Did you purchase a Hub and are you ready to set it up? Watch this video to be guided through. 
+
+https://m.twitch.tv/videos/2725875276?desktop-redirect=true
+
+
 
 ## Install on a Raspberry Pi
 
