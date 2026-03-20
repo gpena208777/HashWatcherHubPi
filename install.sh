@@ -143,6 +143,17 @@ install_latest_release_deb() {
         fail "Package install failed during apt/dpkg configure step."
     fi
 
+    if ! command -v tailscale >/dev/null 2>&1; then
+        info "Installing Tailscale..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    else
+        ok "Tailscale already installed."
+    fi
+
+    if systemctl list-unit-files tailscaled.service >/dev/null 2>&1; then
+        systemctl enable tailscaled --now 2>/dev/null || true
+    fi
+
     installed_version="$(dpkg-query -W -f='${Version}' hashwatcher-hub-pi 2>/dev/null || true)"
     installed_status="$(dpkg-query -W -f='${Status}' hashwatcher-hub-pi 2>/dev/null || true)"
     [[ "${installed_status}" == "install ok installed" ]] || return 1
