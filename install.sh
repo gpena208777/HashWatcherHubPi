@@ -12,9 +12,10 @@
 set -euo pipefail
 
 REPO="gpena208777/HashWatcherHubPi"
-BRANCH="main"
-RELEASE_URL="https://github.com/${REPO}/releases/latest/download/hashwatcher-hub-pi.tar.gz"
-ARCHIVE_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+LATEST_RELEASE_API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+LATEST_RELEASE_TAG=""
+LATEST_RELEASE_DEB_URL=""
+LATEST_RELEASE_ARCHIVE_URL=""
 
 INSTALL_DIR="/opt/hashwatcher-hub-pi"
 CONFIG_DIR="/etc/hashwatcher-hub-pi"
@@ -72,6 +73,54 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/gpena208777/HashWatcherHubPi/main/install.sh | sudo bash
   sudo bash install.sh --source-dir /path/to/hashwatcher-bundle
 EOF
+}
+
+resolve_latest_release() {
+    local release_json parsed release_tag release_deb_url
+
+    release_json="$(curl -fsSL "${LATEST_RELEASE_API_URL}")" || return 1
+
+    parsed="$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+tag = (d.get("tag_name") or "").strip()
+deb_url = ""
+for asset in d.get("assets", []):
+    name = (asset.get("name") or "").strip()
+    url = (asset.get("browser_download_url") or "").strip()
+    if name.startswith("hashwatcher-hub-pi_") and name.endswith("_all.deb") and url:
+        deb_url = url
+        break
+print(tag)
+print(deb_url)
+' <<<"${release_json}")" || return 1
+
+    release_tag="$(printf '%s\n' "${parsed}" | sed -n '1p')"
+    release_deb_url="$(printf '%s\n' "${parsed}" | sed -n '2p')"
+
+    [[ -n "${release_tag}" ]] || return 1
+
+    LATEST_RELEASE_TAG="${release_tag}"
+    LATEST_RELEASE_DEB_URL="${release_deb_url}"
+    LATEST_RELEASE_ARCHIVE_URL="https://github.com/${REPO}/archive/refs/tags/${LATEST_RELEASE_TAG}.tar.gz"
+}
+
+install_latest_release_deb() {
+    local deb_url="$1"
+    local deb_path="$2"
+    local installed_version
+
+    info "Downloading latest release package..."
+    curl -fsSL "${deb_url}" -o "${deb_path}"
+
+    info "Installing latest release package..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${deb_path}"
+
+    installed_version="$(dpkg-query -W -f='${Version}' hashwatcher-hub-pi 2>/dev/null || true)"
+    [[ -n "${installed_version}" ]] || return 1
+
+    ok "Installed hashwatcher-hub-pi version ${installed_version}"
 }
 
 package_installed() {
@@ -244,13 +293,23 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 info "${BOLD}HashWatcher Hub Pi Bootstrap Installer${NC}"
 info "This will download the latest HashWatcher Hub Pi payload and install it on this Raspberry Pi."
 echo ""
-info "Downloading HashWatcher Gateway files..."
+info "Resolving latest release metadata..."
 
-if curl -fsSL "${RELEASE_URL}" | tar -xz -C "${TMP_DIR}" 2>/dev/null; then
-    info "Downloaded latest release bundle."
+if resolve_latest_release; then
+    info "Latest release tag: ${LATEST_RELEASE_TAG}"
 else
-    info "Falling back to repository archive."
-    curl -fsSL "${ARCHIVE_URL}" | tar -xz -C "${TMP_DIR}" --strip-components=1
+    fail "Could not resolve latest release metadata from GitHub."
+fi
+
+if [[ -n "${LATEST_RELEASE_DEB_URL}" ]] && install_latest_release_deb "${LATEST_RELEASE_DEB_URL}" "${TMP_DIR}/hashwatcher-hub-pi.deb"; then
+    exit 0
+fi
+
+info "Falling back to latest release source archive."
+if curl -fsSL "${LATEST_RELEASE_ARCHIVE_URL}" | tar -xz -C "${TMP_DIR}" --strip-components=1; then
+    info "Downloaded latest release archive (${LATEST_RELEASE_TAG})."
+else
+    fail "Failed to download latest release archive (${LATEST_RELEASE_TAG})."
 fi
 
 install_from_source "${TMP_DIR}"
