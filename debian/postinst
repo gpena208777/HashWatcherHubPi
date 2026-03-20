@@ -46,12 +46,14 @@ if [[ "${CURRENT_REQ_HASH}" != "${SAVED_REQ_HASH}" ]]; then
     printf '%s\n' "${CURRENT_REQ_HASH}" > "${REQ_HASH_FILE}"
 fi
 
-# Install Tailscale if not present
-if ! command -v tailscale &>/dev/null; then
-    echo "[HashWatcher] Installing Tailscale..."
-    curl -fsSL https://tailscale.com/install.sh | sh
+# Ensure tailscaled is enabled when Tailscale is already installed.
+# Do not install packages here: this script runs under dpkg and apt locks are held.
+if command -v tailscale &>/dev/null; then
+    systemctl enable tailscaled --now 2>/dev/null || true
+else
+    echo "[HashWatcher] WARNING: Tailscale not found."
+    echo "[HashWatcher] Install later with: curl -fsSL https://tailscale.com/install.sh | sh"
 fi
-systemctl enable tailscaled --now 2>/dev/null || true
 
 # IP forwarding for subnet routing
 cat > /etc/sysctl.d/99-tailscale.conf <<'SYSCTL'

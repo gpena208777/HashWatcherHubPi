@@ -127,13 +127,22 @@ UNIT
 # ── Build the .deb ───────────────────────────────────────────────────
 
 DEB_OUT="${SCRIPT_DIR}/${PKG_NAME}_${VERSION}_all.deb"
-dpkg-deb --build "${PKG_DIR}" "${DEB_OUT}" 2>/dev/null || {
-    # If dpkg-deb isn't available (building on macOS), use fakeroot/docker
-    echo ""
-    echo "dpkg-deb not found locally. To build on macOS, run:"
-    echo "  docker run --rm -v \"${SCRIPT_DIR}:/work\" debian:bookworm-slim dpkg-deb --build /work/_build/${PKG_NAME}_${VERSION}_all /work/${PKG_NAME}_${VERSION}_all.deb"
-    exit 1
-}
+if command -v dpkg-deb &>/dev/null; then
+    dpkg-deb --build "${PKG_DIR}" "${DEB_OUT}" 2>/dev/null || {
+        echo ""
+        echo "Local dpkg-deb failed. To build with Docker, run:"
+        echo "  docker run --rm -v \"${SCRIPT_DIR}:/work\" -w /work debian:bookworm-slim dpkg-deb --build /work/_build/${PKG_NAME}_${VERSION}_all /work/${PKG_NAME}_${VERSION}_all.deb"
+        exit 1
+    }
+else
+    echo "Building .deb via Docker..."
+    docker run --rm -v "${SCRIPT_DIR}:/work" -w /work debian:bookworm-slim \
+        dpkg-deb --build "/work/_build/${PKG_NAME}_${VERSION}_all" "/work/${PKG_NAME}_${VERSION}_all.deb" || {
+        echo "Docker build failed. Try:"
+        echo "  docker run --rm -v \"${SCRIPT_DIR}:/work\" -w /work debian:bookworm-slim dpkg-deb --build /work/_build/${PKG_NAME}_${VERSION}_all /work/${PKG_NAME}_${VERSION}_all.deb"
+        exit 1
+    }
+fi
 
 rm -rf "${SCRIPT_DIR}/_build"
 
