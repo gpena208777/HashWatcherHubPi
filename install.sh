@@ -41,16 +41,48 @@ is_rootfs_read_only() {
     [[ "${mount_opts}" == *"ro"* ]] && [[ "${mount_opts}" != *"rw"* ]]
 }
 
+rootfs_write_test() {
+    local test_path="/etc/.hashwatcher-rw-test.$$"
+    if printf 'ok\n' > "${test_path}" 2>/dev/null; then
+        rm -f "${test_path}" || true
+        return 0
+    fi
+    return 1
+}
+
 require_writable_rootfs() {
+    if ! is_rootfs_read_only && rootfs_write_test; then
+        return 0
+    fi
+
+    info "Root filesystem appears read-only. Attempting remount read-write..."
+    mount -o remount,rw / >/dev/null 2>&1 || true
+
+    if ! is_rootfs_read_only && rootfs_write_test; then
+        ok "Root filesystem remounted read-write."
+        return 0
+    fi
+
     if is_rootfs_read_only; then
         fail "$(cat <<'EOF'
 Root filesystem is mounted read-only.
 This installer needs write access to /etc, /var, and /opt.
 
-On the Pi, run:
+Tried automatic remount, but root is still read-only.
+Run:
   sudo mount -o remount,rw /
 
 If remount fails, schedule a filesystem check and reboot:
+  sudo touch /forcefsck
+  sudo reboot
+EOF
+)"
+    else
+        fail "$(cat <<'EOF'
+Root filesystem appears writable in mount options, but write test failed.
+This usually indicates filesystem errors.
+
+Run:
   sudo touch /forcefsck
   sudo reboot
 EOF
