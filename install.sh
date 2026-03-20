@@ -35,6 +35,29 @@ info()  { echo -e "${CYAN}[HashWatcher]${NC} $*"; }
 ok()    { echo -e "${GREEN}[HashWatcher]${NC} $*"; }
 fail()  { echo -e "${RED}[HashWatcher]${NC} $*" >&2; exit 1; }
 
+is_rootfs_read_only() {
+    local mount_opts
+    mount_opts="$(findmnt -no OPTIONS / 2>/dev/null || true)"
+    [[ "${mount_opts}" == *"ro"* ]] && [[ "${mount_opts}" != *"rw"* ]]
+}
+
+require_writable_rootfs() {
+    if is_rootfs_read_only; then
+        fail "$(cat <<'EOF'
+Root filesystem is mounted read-only.
+This installer needs write access to /etc, /var, and /opt.
+
+On the Pi, run:
+  sudo mount -o remount,rw /
+
+If remount fails, schedule a filesystem check and reboot:
+  sudo touch /forcefsck
+  sudo reboot
+EOF
+)"
+    fi
+}
+
 required_files=(
     hashwatcher_hub_agent.py
     hub_ble_provisioner.py
@@ -109,15 +132,20 @@ install_latest_release_deb() {
     local deb_url="$1"
     local deb_path="$2"
     local installed_version
+    local installed_status
 
     info "Downloading latest release package..."
     curl -fsSL "${deb_url}" -o "${deb_path}"
 
     info "Installing latest release package..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${deb_path}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${deb_path}"; then
+        fail "Package install failed during apt/dpkg configure step."
+    fi
 
     installed_version="$(dpkg-query -W -f='${Version}' hashwatcher-hub-pi 2>/dev/null || true)"
+    installed_status="$(dpkg-query -W -f='${Status}' hashwatcher-hub-pi 2>/dev/null || true)"
+    [[ "${installed_status}" == "install ok installed" ]] || return 1
     [[ -n "${installed_version}" ]] || return 1
 
     ok "Installed hashwatcher-hub-pi version ${installed_version}"
@@ -186,7 +214,7 @@ EOF
 
     if ! id "${SERVICE_USER}" &>/dev/null; then
         info "Creating service user: ${SERVICE_USER}"
-        useradd -r -m -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
+        useradd -r -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
     fi
 
     install -d -m 0755 "${INSTALL_DIR}" "${CONFIG_DIR}" "${INSTALL_DIR}/updates"
@@ -281,6 +309,7 @@ done
 
 [[ "$(uname -s)" == "Linux" ]] || fail "This installer is for Linux (Raspberry Pi OS)."
 [[ "$(id -u)" -eq 0 ]] || fail "Please run as root."
+require_writable_rootfs
 
 if [[ -n "${SOURCE_DIR}" ]]; then
     install_from_source "${SOURCE_DIR}"

@@ -7,9 +7,22 @@ SERVICE_USER="hashwatcher-hub-pi"
 VENV_DIR="${INSTALL_DIR}/.venv"
 REQ_HASH_FILE="${INSTALL_DIR}/.requirements.sha256"
 
+is_rootfs_read_only() {
+    local mount_opts
+    mount_opts="$(findmnt -no OPTIONS / 2>/dev/null || true)"
+    [[ "${mount_opts}" == *"ro"* ]] && [[ "${mount_opts}" != *"rw"* ]]
+}
+
+if is_rootfs_read_only; then
+    echo "[HashWatcher] ERROR: Root filesystem is mounted read-only."
+    echo "[HashWatcher] Run: sudo mount -o remount,rw /"
+    echo "[HashWatcher] If that fails: sudo touch /forcefsck && sudo reboot"
+    exit 1
+fi
+
 # Create service user if missing
 if ! id "${SERVICE_USER}" &>/dev/null; then
-    useradd -r -m -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
+    useradd -r -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
 fi
 
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
@@ -20,8 +33,16 @@ CURRENT_REQ_HASH="$(sha256sum "${INSTALL_DIR}/requirements.txt" | awk '{print $1
 SAVED_REQ_HASH="$(cat "${REQ_HASH_FILE}" 2>/dev/null || true)"
 
 if [[ "${CURRENT_REQ_HASH}" != "${SAVED_REQ_HASH}" ]]; then
-    "${VENV_DIR}/bin/pip" install --upgrade pip -q 2>/dev/null
-    "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q 2>/dev/null
+    if ! "${VENV_DIR}/bin/pip" install --upgrade pip -q; then
+        echo "[HashWatcher] ERROR: pip bootstrap failed in ${VENV_DIR}."
+        exit 1
+    fi
+    if ! "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q; then
+        echo "[HashWatcher] ERROR: Python dependency install failed."
+        echo "[HashWatcher] Re-running pip in verbose mode for diagnostics..."
+        "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt"
+        exit 1
+    fi
     printf '%s\n' "${CURRENT_REQ_HASH}" > "${REQ_HASH_FILE}"
 fi
 
