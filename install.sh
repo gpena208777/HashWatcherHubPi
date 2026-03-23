@@ -41,48 +41,16 @@ is_rootfs_read_only() {
     [[ "${mount_opts}" == *"ro"* ]] && [[ "${mount_opts}" != *"rw"* ]]
 }
 
-rootfs_write_test() {
-    local test_path="/etc/.hashwatcher-rw-test.$$"
-    if printf 'ok\n' > "${test_path}" 2>/dev/null; then
-        rm -f "${test_path}" || true
-        return 0
-    fi
-    return 1
-}
-
 require_writable_rootfs() {
-    if ! is_rootfs_read_only && rootfs_write_test; then
-        return 0
-    fi
-
-    info "Root filesystem appears read-only. Attempting remount read-write..."
-    mount -o remount,rw / >/dev/null 2>&1 || true
-
-    if ! is_rootfs_read_only && rootfs_write_test; then
-        ok "Root filesystem remounted read-write."
-        return 0
-    fi
-
     if is_rootfs_read_only; then
         fail "$(cat <<'EOF'
 Root filesystem is mounted read-only.
 This installer needs write access to /etc, /var, and /opt.
 
-Tried automatic remount, but root is still read-only.
-Run:
+On the Pi, run:
   sudo mount -o remount,rw /
 
 If remount fails, schedule a filesystem check and reboot:
-  sudo touch /forcefsck
-  sudo reboot
-EOF
-)"
-    else
-        fail "$(cat <<'EOF'
-Root filesystem appears writable in mount options, but write test failed.
-This usually indicates filesystem errors.
-
-Run:
   sudo touch /forcefsck
   sudo reboot
 EOF
@@ -91,6 +59,7 @@ EOF
 }
 
 required_files=(
+    VERSION
     hashwatcher_hub_agent.py
     hub_ble_provisioner.py
     tailscale_setup.py
@@ -175,17 +144,6 @@ install_latest_release_deb() {
         fail "Package install failed during apt/dpkg configure step."
     fi
 
-    if ! command -v tailscale >/dev/null 2>&1; then
-        info "Installing Tailscale..."
-        curl -fsSL https://tailscale.com/install.sh | sh
-    else
-        ok "Tailscale already installed."
-    fi
-
-    if systemctl list-unit-files tailscaled.service >/dev/null 2>&1; then
-        systemctl enable tailscaled --now 2>/dev/null || true
-    fi
-
     installed_version="$(dpkg-query -W -f='${Version}' hashwatcher-hub-pi 2>/dev/null || true)"
     installed_status="$(dpkg-query -W -f='${Status}' hashwatcher-hub-pi 2>/dev/null || true)"
     [[ "${installed_status}" == "install ok installed" ]] || return 1
@@ -265,6 +223,8 @@ EOF
     for f in hashwatcher_hub_agent.py hub_ble_provisioner.py tailscale_setup.py requirements.txt; do
         install -m 0644 "${src}/${f}" "${INSTALL_DIR}/${f}"
     done
+
+    install -m 0644 "${src}/VERSION" "${INSTALL_DIR}/VERSION"
 
     if [[ -f "${src}/icon.png" ]]; then
         install -m 0644 "${src}/icon.png" "${INSTALL_DIR}/icon.png"

@@ -26,8 +26,81 @@ import hashlib
 
 import tailscale_setup
 
-AGENT_VERSION = "1.0.1"
+def resolve_agent_version() -> str:
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
+        "/opt/hashwatcher-hub-pi/VERSION",
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                version = f.read().strip()
+            if version:
+                return version
+        except Exception:
+            continue
+    return "0.0.0-dev"
+
+
+AGENT_VERSION = resolve_agent_version()
+STATUS_API_VERSION = "1"
 GITHUB_REPO = "gpena208777/HashWatcherHubPi"
+
+HUB_AUTOMATION_PROFILES: Dict[str, Dict[str, Any]] = {
+    "monitor_only": {
+        "label": "Monitor Only",
+        "description": "Track miner health and alerts only. No automatic recovery actions.",
+        "autoRecoveryEnabled": False,
+        "failureThreshold": None,
+        "cooldownSeconds": None,
+    },
+    "auto_recover": {
+        "label": "Auto Recover",
+        "description": "Restart the paired miner when repeated network failures are detected.",
+        "autoRecoveryEnabled": True,
+        "failureThreshold": 3,
+        "cooldownSeconds": 300,
+    },
+    "aggressive_recover": {
+        "label": "Aggressive Recover",
+        "description": "Faster recovery attempts for unstable networks with shorter trigger and cooldown windows.",
+        "autoRecoveryEnabled": True,
+        "failureThreshold": 2,
+        "cooldownSeconds": 120,
+    },
+}
+DEFAULT_AUTOMATION_MODE = "monitor_only"
+
+BITAXE_TUNE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "stock": {"label": "Stock", "frequency": 600, "coreVoltage": 1150},
+    "mild_oc": {"label": "Mild OC", "frequency": 605, "coreVoltage": 1150},
+    "med_oc": {"label": "Med OC", "frequency": 620, "coreVoltage": 1160},
+    "heavy_oc": {"label": "Heavy OC", "frequency": 675, "coreVoltage": 1170},
+}
+
+CANAAN_WORK_MODE_OPTIONS: Dict[str, str] = {
+    "0": "Low",
+    "1": "Mid",
+    "2": "High",
+}
+
+CANAAN_WORK_MODE_PROFILES: Dict[str, List[Dict[str, str]]] = {
+    "mini3": [
+        {"id": "0", "label": "Heater"},
+        {"id": "1", "label": "Mining"},
+        {"id": "2", "label": "Night"},
+    ],
+    "avalon_q": [
+        {"id": "0", "label": "Eco"},
+        {"id": "1", "label": "Standard"},
+        {"id": "2", "label": "Super"},
+    ],
+    "default": [
+        {"id": "0", "label": "Low"},
+        {"id": "1", "label": "Mid"},
+        {"id": "2", "label": "High"},
+    ],
+}
 
 
 def env_str(name: str, default: str) -> str:
@@ -77,6 +150,16 @@ def parse_int(value: Any, default: int, minimum: Optional[int] = None, maximum: 
     return parsed
 
 
+def normalize_mac(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    hex_only = re.sub(r"[^0-9a-f]", "", raw)
+    if len(hex_only) != 12:
+        return ""
+    return ":".join(hex_only[i:i + 2] for i in range(0, 12, 2))
+
+
 def to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -91,6 +174,27 @@ def to_float(value: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+def _version_tuple(value: str) -> Optional[tuple[int, ...]]:
+    """Extract comparable numeric version parts from a string like v1.2.3."""
+    parts = re.findall(r"\d+", value or "")
+    if not parts:
+        return None
+    return tuple(int(part) for part in parts[:4])
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    """Return True when candidate is semantically newer than current."""
+    cand_tuple = _version_tuple(candidate)
+    curr_tuple = _version_tuple(current)
+    if cand_tuple is None or curr_tuple is None:
+        return candidate.strip() != current.strip()
+
+    width = max(len(cand_tuple), len(curr_tuple))
+    cand_padded = cand_tuple + (0,) * (width - len(cand_tuple))
+    curr_padded = curr_tuple + (0,) * (width - len(curr_tuple))
+    return cand_padded > curr_padded
 
 
 class HubState:
@@ -143,8 +247,15 @@ class HubAgent:
         self.paired_miner_hostname = ""
         self.paired = bool(self.bitaxe_host.strip())
         self.user_subnet_cidr = ""
+        self.automation_mode = DEFAULT_AUTOMATION_MODE
+        self.experimental_features_enabled = False
+        self.fleet_schedules: List[Dict[str, Any]] = []
+        self.fleet_inventory: List[Dict[str, Any]] = []
+        self.bitaxe_tune_by_mac: Dict[str, str] = {}
 
         self.config_lock = threading.Lock()
+        self._automation_lock = threading.Lock()
+        self._fleet_lock = threading.Lock()
         self._load_runtime_config()
         self._cpu_prev_total = 0
         self._cpu_prev_idle = 0
@@ -162,6 +273,10 @@ class HubAgent:
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
         self._max_log_entries = 200
+        self._consecutive_poll_failures = 0
+        self._last_recovery_attempt_at_iso: Optional[str] = None
+        self._last_recovery_attempt_at_ts: Optional[float] = None
+        self._last_recovery_result: Optional[Dict[str, Any]] = None
 
     def _log(self, source: str, message: str, level: str = "error") -> None:
         entry: Dict[str, Any] = {
@@ -190,6 +305,11 @@ class HubAgent:
             paired_miner_hostname = str(cfg.get("minerHostname", "")).strip()
             paired_flag = cfg.get("paired")
             user_subnet_cidr = str(cfg.get("userSubnetCIDR", "")).strip()
+            automation_mode = str(cfg.get("automationMode", DEFAULT_AUTOMATION_MODE)).strip()
+            experimental_features_enabled = bool(cfg.get("experimentalFeaturesEnabled", False))
+            fleet_schedules = cfg.get("fleetSchedules", [])
+            fleet_inventory = cfg.get("fleetInventory", [])
+            bitaxe_tune_by_mac = cfg.get("bitaxeTuneByMac", {})
 
             if bitaxe_host:
                 self.bitaxe_host = bitaxe_host
@@ -209,6 +329,23 @@ class HubAgent:
                 self.paired = bool(self.bitaxe_host.strip())
             if user_subnet_cidr:
                 self.user_subnet_cidr = user_subnet_cidr
+            self.automation_mode = self._normalize_automation_mode(automation_mode)
+            self.experimental_features_enabled = bool(experimental_features_enabled)
+            if isinstance(fleet_schedules, list):
+                normalized = [self._normalize_fleet_schedule(item) for item in fleet_schedules]
+                self.fleet_schedules = [item for item in normalized if item is not None]
+            if isinstance(fleet_inventory, list):
+                normalized_inventory = [self._normalize_fleet_inventory_item(item) for item in fleet_inventory]
+                self.fleet_inventory = [item for item in normalized_inventory if item is not None]
+            if isinstance(bitaxe_tune_by_mac, dict):
+                normalized_tunes: Dict[str, str] = {}
+                for raw_mac, raw_tune in bitaxe_tune_by_mac.items():
+                    mac = normalize_mac(raw_mac)
+                    tune = str(raw_tune or "").strip().lower()
+                    if mac and tune in BITAXE_TUNE_PRESETS:
+                        normalized_tunes[mac] = tune
+                self.bitaxe_tune_by_mac = normalized_tunes
+            self._hydrate_inventory_with_saved_bitaxe_tunes(self.fleet_inventory)
         except Exception as exc:  # pylint: disable=broad-except
             print(f"[{now_iso()}] WARNING: failed to load runtime config: {exc}", flush=True)
 
@@ -222,6 +359,11 @@ class HubAgent:
             "minerHostname": self.paired_miner_hostname,
             "paired": self.paired,
             "userSubnetCIDR": self.user_subnet_cidr,
+            "automationMode": self.automation_mode,
+            "experimentalFeaturesEnabled": self.experimental_features_enabled,
+            "fleetSchedules": self.fleet_schedules,
+            "fleetInventory": self.fleet_inventory,
+            "bitaxeTuneByMac": self.bitaxe_tune_by_mac,
             "updatedAtIso": now_iso(),
         }
         os.makedirs(os.path.dirname(self.runtime_config_path), exist_ok=True)
@@ -315,6 +457,11 @@ class HubAgent:
                 "minerHostname": self.paired_miner_hostname,
                 "paired": self.paired,
                 "userSubnetCIDR": self.user_subnet_cidr,
+                "automationMode": self.automation_mode,
+                "experimentalFeaturesEnabled": self.experimental_features_enabled,
+                "fleetSchedules": self.fleet_schedules,
+                "fleetInventory": self.fleet_inventory,
+                "bitaxeTuneByMac": self.bitaxe_tune_by_mac,
                 "piHostname": self.pi_hostname,
                 "statusHttpPort": self.status_http_port,
             }
@@ -342,9 +489,778 @@ class HubAgent:
                 self.paired_miner_hostname = str(updates.get("minerHostname") or "").strip()
             if "paired" in updates:
                 self.paired = bool(updates.get("paired"))
+            if "automationMode" in updates:
+                self.automation_mode = self._normalize_automation_mode(updates.get("automationMode"))
 
             self._persist_runtime_config()
             return self.get_runtime_config()
+
+    def _normalize_automation_mode(self, value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in HUB_AUTOMATION_PROFILES:
+            return mode
+        return DEFAULT_AUTOMATION_MODE
+
+    def _automation_profile(self, mode: Optional[str] = None) -> Dict[str, Any]:
+        mode_value = self._normalize_automation_mode(mode or self.automation_mode)
+        return HUB_AUTOMATION_PROFILES[mode_value]
+
+    def get_automation_status(self) -> Dict[str, Any]:
+        with self.config_lock:
+            mode = self._normalize_automation_mode(self.automation_mode)
+            profile = self._automation_profile(mode)
+        with self._automation_lock:
+            failures = self._consecutive_poll_failures
+            last_attempt_iso = self._last_recovery_attempt_at_iso
+            last_result = dict(self._last_recovery_result) if isinstance(self._last_recovery_result, dict) else None
+        return {
+            "mode": mode,
+            "modeLabel": profile["label"],
+            "description": profile["description"],
+            "autoRecoveryEnabled": profile["autoRecoveryEnabled"],
+            "failureThreshold": profile["failureThreshold"],
+            "cooldownSeconds": profile["cooldownSeconds"],
+            "consecutiveFailures": failures,
+            "lastRecoveryAttemptAtIso": last_attempt_iso,
+            "lastRecovery": last_result,
+            "supportedModes": [
+                {
+                    "id": mode_id,
+                    "label": cfg["label"],
+                    "description": cfg["description"],
+                }
+                for mode_id, cfg in HUB_AUTOMATION_PROFILES.items()
+            ],
+        }
+
+    def set_automation_mode(self, mode: Any) -> Dict[str, Any]:
+        if not self.experimental_features_enabled:
+            return {
+                "ok": False,
+                "error": "Experimental features are disabled.",
+            }
+        requested = str(mode or "").strip().lower()
+        if requested not in HUB_AUTOMATION_PROFILES:
+            return {
+                "ok": False,
+                "error": f"Invalid automation mode '{requested or 'empty'}'.",
+                "supportedModes": list(HUB_AUTOMATION_PROFILES.keys()),
+            }
+        normalized = requested
+        with self.config_lock:
+            self.automation_mode = normalized
+            self._persist_runtime_config()
+        with self._automation_lock:
+            self._consecutive_poll_failures = 0
+        status = self.get_automation_status()
+        return {
+            "ok": True,
+            "message": f"Automation mode set to {status['modeLabel']}.",
+            "automation": status,
+        }
+
+    def set_experimental_features_enabled(self, enabled: Any) -> Dict[str, Any]:
+        with self.config_lock:
+            self.experimental_features_enabled = bool(enabled)
+            self._persist_runtime_config()
+        return {
+            "ok": True,
+            "experimentalFeaturesEnabled": self.experimental_features_enabled,
+            "message": (
+                "Experimental hub features enabled."
+                if self.experimental_features_enabled
+                else "Experimental hub features disabled."
+            ),
+        }
+
+    def feature_gates_status(self) -> Dict[str, Any]:
+        return {
+            "experimentalFeaturesEnabled": bool(self.experimental_features_enabled),
+        }
+
+    def local_clock_status(self) -> Dict[str, Any]:
+        local_now = datetime.now().astimezone()
+        offset = local_now.utcoffset()
+        offset_minutes = int(offset.total_seconds() / 60) if offset is not None else 0
+        tz_name = local_now.tzname() or time.tzname[0] if time.tzname else "local"
+        return {
+            "localTimeIso": local_now.isoformat(),
+            "timezone": tz_name,
+            "utcOffsetMinutes": offset_minutes,
+        }
+
+    def _normalize_fleet_device_type(self, raw_device_type: Any) -> str:
+        raw = str(raw_device_type or "").strip().lower()
+        if raw in {"bitaxe", "nerdq", "bitdsk", "octaxe"}:
+            return "bitaxe"
+        if raw == "canaan":
+            return "canaan"
+        return raw
+
+    def _normalize_canaan_subtype(self, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if "avalon" in text and "q" in text:
+            return "avalon_q"
+        if "mini3" in text:
+            return "mini3"
+        if "nano3" in text:
+            return "nano3"
+        return "unknown"
+
+    def _canaan_work_modes_for_subtype(self, subtype: str) -> List[Dict[str, str]]:
+        profile_key = subtype if subtype in CANAAN_WORK_MODE_PROFILES else "default"
+        if profile_key == "nano3":
+            profile_key = "default"
+        profile = CANAAN_WORK_MODE_PROFILES.get(profile_key, CANAAN_WORK_MODE_PROFILES["default"])
+        return [dict(item) for item in profile]
+
+    def _normalize_canaan_mode_options(self, raw_modes: Any, subtype: str) -> List[Dict[str, str]]:
+        if not isinstance(raw_modes, list):
+            return self._canaan_work_modes_for_subtype(subtype)
+        normalized: List[Dict[str, str]] = []
+        for item in raw_modes:
+            if not isinstance(item, dict):
+                continue
+            mode_id = str(item.get("id") or "").strip()
+            label = str(item.get("label") or "").strip()
+            if not mode_id:
+                continue
+            normalized.append({
+                "id": mode_id,
+                "label": label or f"Mode {mode_id}",
+            })
+        return normalized or self._canaan_work_modes_for_subtype(subtype)
+
+    def _is_valid_canaan_mode_value(self, value: str) -> bool:
+        valid_values = {str(key) for key in CANAAN_WORK_MODE_OPTIONS.keys()}
+        for options in CANAAN_WORK_MODE_PROFILES.values():
+            valid_values.update(str(item.get("id") or "").strip() for item in options)
+        return value in valid_values
+
+    def _normalize_fleet_inventory_item(self, raw: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+
+        device_type = self._normalize_fleet_device_type(raw.get("deviceType"))
+        if device_type not in {"bitaxe", "canaan"}:
+            return None
+
+        ip = str(raw.get("ip") or "").strip()
+        mac = normalize_mac(raw.get("mac"))
+        if not ip and not mac:
+            return None
+
+        model = str(raw.get("model") or "").strip() or None
+        name = str(raw.get("name") or raw.get("hostname") or "").strip()
+        if not name:
+            name = model or ip or mac
+
+        subtype_raw = raw.get("deviceSubtype") or raw.get("subtype")
+        subtype = self._normalize_canaan_subtype(subtype_raw if subtype_raw is not None else model)
+        saved_tune = str(raw.get("savedBitaxeTune") or "").strip().lower()
+        if saved_tune not in BITAXE_TUNE_PRESETS:
+            saved_tune = self.bitaxe_tune_by_mac.get(mac, "") if mac else ""
+        if saved_tune not in BITAXE_TUNE_PRESETS:
+            saved_tune = ""
+
+        supported_modes = (
+            self._normalize_canaan_mode_options(raw.get("supportedWorkModes"), subtype)
+            if device_type == "canaan"
+            else []
+        )
+
+        device_id = (mac or ip).lower()
+        return {
+            "id": device_id,
+            "name": name,
+            "deviceType": device_type,
+            "ip": ip,
+            "mac": mac or None,
+            "model": model,
+            "deviceSubtype": subtype if device_type == "canaan" else None,
+            "supportedWorkModes": supported_modes,
+            "savedBitaxeTune": saved_tune if device_type == "bitaxe" and saved_tune else None,
+            "lastSeenAtIso": str(raw.get("lastSeenAtIso") or "").strip() or None,
+            "lastCapabilityProbeAtIso": str(raw.get("lastCapabilityProbeAtIso") or "").strip() or None,
+            "lastCapabilityProbeError": str(raw.get("lastCapabilityProbeError") or "").strip() or None,
+        }
+
+    def _hydrate_inventory_with_saved_bitaxe_tunes(self, inventory: List[Dict[str, Any]]) -> None:
+        for item in inventory:
+            if str(item.get("deviceType") or "").strip().lower() != "bitaxe":
+                continue
+            mac = normalize_mac(item.get("mac"))
+            if not mac:
+                continue
+            saved = self.bitaxe_tune_by_mac.get(mac)
+            if saved in BITAXE_TUNE_PRESETS:
+                item["savedBitaxeTune"] = saved
+
+    def _send_cgminer_json_command(self, target_ip: str, command: str, port: int = 4028) -> Dict[str, Any]:
+        sock = None
+        try:
+            sock = socket.create_connection((target_ip, port), timeout=max(2.0, float(self.http_timeout_seconds)))
+            sock.settimeout(5)
+            payload = json.dumps({"command": command}) + "\n"
+            sock.sendall(payload.encode("utf-8"))
+            chunks: List[bytes] = []
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw_text = b"".join(chunks).decode("utf-8", errors="ignore").replace("\x00", "").strip()
+            if not raw_text:
+                return {"ok": False, "error": "No response from miner."}
+            try:
+                data = json.loads(raw_text)
+            except Exception as exc:  # pylint: disable=broad-except
+                return {"ok": False, "error": f"Invalid JSON response: {exc}", "raw": raw_text[:6000]}
+            return {"ok": True, "data": data, "raw": raw_text[:6000]}
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"ok": False, "error": str(exc)}
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _infer_canaan_subtype_from_version(self, version_entry: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key in ["PROD", "Model", "MODEL", "HWTYPE", "SWTYPE", "Type", "type"]:
+            value = version_entry.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip().lower())
+        combined = " ".join(parts)
+        if "avalon" in combined and "q" in combined:
+            return "avalon_q"
+        if "mini3" in combined:
+            return "mini3"
+        if "nano3" in combined:
+            return "nano3"
+        return "unknown"
+
+    def _probe_canaan_capabilities(self, target_ip: str) -> Dict[str, Any]:
+        result = self._send_cgminer_json_command(target_ip, "version")
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or "Version command failed."}
+        data = result.get("data")
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "Unexpected version payload."}
+
+        version_entries = data.get("VERSION")
+        if not isinstance(version_entries, list) or not version_entries:
+            return {"ok": False, "error": "VERSION data missing in response."}
+        first = version_entries[0] if isinstance(version_entries[0], dict) else {}
+        model = (
+            str(first.get("Model") or "").strip()
+            or str(first.get("MODEL") or "").strip()
+            or str(first.get("PROD") or "").strip()
+        )
+        mac = normalize_mac(first.get("MAC") or first.get("Mac") or first.get("mac"))
+        subtype = self._infer_canaan_subtype_from_version(first)
+        supported_modes = self._canaan_work_modes_for_subtype(subtype)
+
+        return {
+            "ok": True,
+            "model": model or None,
+            "mac": mac or None,
+            "deviceSubtype": subtype,
+            "supportedWorkModes": supported_modes,
+            "raw": result.get("raw"),
+        }
+
+    def _refresh_canaan_capabilities_for_inventory(self, inventory: List[Dict[str, Any]]) -> None:
+        probe_ts = now_iso()
+        for item in inventory:
+            if str(item.get("deviceType") or "").strip().lower() != "canaan":
+                continue
+            ip = str(item.get("ip") or "").strip()
+            if not ip:
+                continue
+            probe = self._probe_canaan_capabilities(ip)
+            item["lastCapabilityProbeAtIso"] = probe_ts
+            if probe.get("ok"):
+                mac = normalize_mac(probe.get("mac") or item.get("mac"))
+                if mac:
+                    item["mac"] = mac
+                if probe.get("model"):
+                    item["model"] = probe.get("model")
+                subtype = self._normalize_canaan_subtype(probe.get("deviceSubtype"))
+                item["deviceSubtype"] = subtype
+                item["supportedWorkModes"] = self._normalize_canaan_mode_options(probe.get("supportedWorkModes"), subtype)
+                item["lastCapabilityProbeError"] = None
+                if str(item.get("name") or "").strip() in {"", ip} and item.get("model"):
+                    item["name"] = str(item.get("model"))
+            else:
+                item["lastCapabilityProbeError"] = str(probe.get("error") or "Unknown error")
+                subtype = self._normalize_canaan_subtype(item.get("deviceSubtype") or item.get("model"))
+                item["deviceSubtype"] = subtype
+                item["supportedWorkModes"] = self._normalize_canaan_mode_options(item.get("supportedWorkModes"), subtype)
+
+    def set_fleet_inventory(self, devices: Any) -> Dict[str, Any]:
+        if not self.experimental_features_enabled:
+            return {"ok": False, "error": "Experimental features are disabled."}
+        if not isinstance(devices, list):
+            return {"ok": False, "error": "inventory must be an array."}
+
+        normalized = [self._normalize_fleet_inventory_item(item) for item in devices]
+        sanitized = [item for item in normalized if item is not None]
+        if len(sanitized) > 512:
+            return {"ok": False, "error": "Too many inventory devices. Max 512."}
+
+        working_inventory = [dict(item) for item in sanitized]
+        self._hydrate_inventory_with_saved_bitaxe_tunes(working_inventory)
+        self._refresh_canaan_capabilities_for_inventory(working_inventory)
+
+        with self._fleet_lock:
+            self.fleet_inventory = working_inventory
+            for device in self.fleet_inventory:
+                mac = normalize_mac(device.get("mac"))
+                if not mac:
+                    continue
+                device["id"] = mac
+                if str(device.get("deviceType") or "").strip().lower() == "bitaxe":
+                    tune = str(device.get("savedBitaxeTune") or "").strip().lower()
+                    if tune in BITAXE_TUNE_PRESETS:
+                        self.bitaxe_tune_by_mac[mac] = tune
+
+        with self.config_lock:
+            self._persist_runtime_config()
+
+        return {
+            "ok": True,
+            "message": f"Saved {len(sanitized)} fleet inventory device(s).",
+            "fleetManager": self.get_fleet_manager_status(),
+        }
+
+    def _find_inventory_device_by_mac_or_ip(self, target_mac: str, target_ip: str, device_type_hint: str) -> Optional[Dict[str, Any]]:
+        normalized_mac = normalize_mac(target_mac)
+        normalized_ip = str(target_ip or "").strip()
+        normalized_type = self._normalize_fleet_device_type(device_type_hint)
+
+        if normalized_mac:
+            for item in self.fleet_inventory:
+                if normalize_mac(item.get("mac")) == normalized_mac:
+                    return item
+        if normalized_ip:
+            for item in self.fleet_inventory:
+                item_ip = str(item.get("ip") or "").strip()
+                item_type = self._normalize_fleet_device_type(item.get("deviceType"))
+                if item_ip != normalized_ip:
+                    continue
+                if normalized_type and item_type and item_type != normalized_type:
+                    continue
+                return item
+        return None
+
+    def _normalize_fleet_schedule(self, raw: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+
+        target_ip = str(raw.get("targetIp") or "").strip()
+        target_mac = normalize_mac(raw.get("targetMac"))
+        if not target_ip and not target_mac:
+            return None
+
+        action_type = str(raw.get("actionType") or "").strip().lower()
+        if action_type not in {"bitaxe_tune", "canaan_work_mode"}:
+            return None
+
+        mode_value_raw = raw.get("modeValue")
+        mode_value = str(mode_value_raw).strip().lower()
+        if action_type == "bitaxe_tune":
+            if mode_value not in BITAXE_TUNE_PRESETS:
+                return None
+        else:
+            if not self._is_valid_canaan_mode_value(mode_value):
+                return None
+
+        device_type = self._normalize_fleet_device_type(raw.get("deviceType"))
+        if not device_type:
+            device_type = "bitaxe" if action_type == "bitaxe_tune" else "canaan"
+
+        hour = parse_int(raw.get("hour"), default=0, minimum=0, maximum=23)
+        minute = parse_int(raw.get("minute"), default=0, minimum=0, maximum=59)
+        days_mask = parse_int(raw.get("daysMask"), default=127, minimum=1, maximum=127)
+        target_identity = target_mac or target_ip
+        schedule_id = str(raw.get("id") or "").strip() or hashlib.sha1(
+            f"{target_identity}:{action_type}:{mode_value}:{hour}:{minute}:{days_mask}".encode("utf-8")
+        ).hexdigest()[:12]
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            pretty_mode = mode_value.replace("_", " ").title()
+            name = f"{target_identity} {pretty_mode}"
+
+        last_slot = str(raw.get("lastTriggeredSlot") or "").strip() or None
+        last_triggered_at_iso = str(raw.get("lastTriggeredAtIso") or "").strip() or None
+        last_result = raw.get("lastResult")
+        if not isinstance(last_result, dict):
+            last_result = None
+
+        return {
+            "id": schedule_id,
+            "name": name,
+            "enabled": bool(raw.get("enabled", True)),
+            "targetIp": target_ip,
+            "targetMac": target_mac or None,
+            "deviceType": device_type,
+            "actionType": action_type,
+            "modeValue": mode_value,
+            "hour": hour,
+            "minute": minute,
+            "daysMask": days_mask,
+            "lastTriggeredSlot": last_slot,
+            "lastTriggeredAtIso": last_triggered_at_iso,
+            "lastResult": last_result,
+        }
+
+    def fleet_presets(self) -> Dict[str, Any]:
+        return {
+            "bitaxeTunes": [
+                {
+                    "id": key,
+                    "label": preset["label"],
+                    "frequency": preset["frequency"],
+                    "coreVoltage": preset["coreVoltage"],
+                }
+                for key, preset in BITAXE_TUNE_PRESETS.items()
+            ],
+            "canaanWorkModes": [
+                {"id": key, "label": label}
+                for key, label in CANAAN_WORK_MODE_OPTIONS.items()
+            ],
+        }
+
+    def get_fleet_manager_status(self) -> Dict[str, Any]:
+        with self._fleet_lock:
+            schedules = [dict(item) for item in self.fleet_schedules]
+            inventory = [dict(item) for item in self.fleet_inventory]
+            bitaxe_tune_by_mac = dict(self.bitaxe_tune_by_mac)
+        return {
+            "clock": self.local_clock_status(),
+            "schedules": schedules,
+            "presets": self.fleet_presets(),
+            "inventory": inventory,
+            "bitaxeTuneByMac": bitaxe_tune_by_mac,
+        }
+
+    def set_fleet_schedules(self, schedules: Any) -> Dict[str, Any]:
+        if not self.experimental_features_enabled:
+            return {"ok": False, "error": "Experimental features are disabled."}
+        if not isinstance(schedules, list):
+            return {"ok": False, "error": "schedules must be an array."}
+
+        normalized = [self._normalize_fleet_schedule(item) for item in schedules]
+        sanitized = [item for item in normalized if item is not None]
+        if len(sanitized) > 256:
+            return {"ok": False, "error": "Too many schedules. Max 256."}
+
+        with self._fleet_lock:
+            self.fleet_schedules = sanitized
+            for schedule in sanitized:
+                if schedule.get("actionType") != "bitaxe_tune":
+                    continue
+                target_mac = normalize_mac(schedule.get("targetMac"))
+                mode_value = str(schedule.get("modeValue") or "").strip().lower()
+                if target_mac and mode_value in BITAXE_TUNE_PRESETS:
+                    self.bitaxe_tune_by_mac[target_mac] = mode_value
+            self._hydrate_inventory_with_saved_bitaxe_tunes(self.fleet_inventory)
+
+        with self.config_lock:
+            self._persist_runtime_config()
+
+        return {
+            "ok": True,
+            "message": f"Saved {len(sanitized)} fleet schedule(s).",
+            "fleetManager": self.get_fleet_manager_status(),
+        }
+
+    def _schedule_includes_weekday(self, days_mask: int, weekday_index: int) -> bool:
+        return (days_mask & (1 << weekday_index)) != 0
+
+    def _apply_bitaxe_tune(self, target_ip: str, tune_id: str, target_mac: str = "") -> Dict[str, Any]:
+        preset = BITAXE_TUNE_PRESETS.get(tune_id)
+        if not preset:
+            return {"ok": False, "error": f"Unknown BitAxe tune '{tune_id}'."}
+
+        url = f"{self.bitaxe_scheme}://{target_ip}/api/system"
+        payload = {
+            "frequency": preset["frequency"],
+            "coreVoltage": preset["coreVoltage"],
+        }
+        try:
+            response = self.session.patch(url, json=payload, timeout=max(3.0, float(self.http_timeout_seconds)))
+            if not response.ok:
+                return {"ok": False, "error": f"HTTP {response.status_code}", "statusCode": response.status_code}
+            return {
+                "ok": True,
+                "message": f"Applied {preset['label']} tune.",
+                "appliedTuneId": tune_id,
+                "targetMac": normalize_mac(target_mac) or None,
+                "url": url,
+                "payload": payload,
+                "statusCode": response.status_code,
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"ok": False, "error": str(exc), "url": url}
+
+    def _send_cgminer_raw_command(self, target_ip: str, command: str, port: int = 4028) -> Dict[str, Any]:
+        sock = None
+        try:
+            sock = socket.create_connection((target_ip, port), timeout=max(2.0, float(self.http_timeout_seconds)))
+            sock.settimeout(5)
+            sock.sendall((command + "\n").encode("utf-8"))
+            chunks: List[bytes] = []
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw_text = b"".join(chunks).decode("utf-8", errors="ignore").strip()
+            code_match = re.search(r"Code=(\d+)", raw_text)
+            code_value = int(code_match.group(1)) if code_match else None
+            ok = code_value in (118, 119) if code_value is not None else ("STATUS=S" in raw_text)
+            return {
+                "ok": bool(ok),
+                "code": code_value,
+                "raw": raw_text[:6000],
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"ok": False, "error": str(exc)}
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _apply_canaan_work_mode(self, target_ip: str, device_type: str, mode_value: str) -> Dict[str, Any]:
+        mode_int = parse_int(mode_value, default=-1, minimum=0, maximum=2)
+        if mode_int not in (0, 1, 2):
+            return {"ok": False, "error": "Work mode must be 0, 1, or 2."}
+
+        preferred_command = (
+            f"ascset|0,worklevel,set,{mode_int}"
+            if "nano3" in (device_type or "")
+            else f"ascset|0,workmode,set,{mode_int}"
+        )
+        fallback_command = (
+            f"ascset|0,workmode,set,{mode_int}"
+            if preferred_command.endswith("worklevel,set," + str(mode_int))
+            else f"ascset|0,worklevel,set,{mode_int}"
+        )
+
+        first = self._send_cgminer_raw_command(target_ip, preferred_command)
+        if first.get("ok"):
+            first["message"] = f"Applied Canaan work mode {mode_int}."
+            return first
+
+        second = self._send_cgminer_raw_command(target_ip, fallback_command)
+        if second.get("ok"):
+            second["message"] = f"Applied Canaan work mode {mode_int}."
+            return second
+
+        return {
+            "ok": False,
+            "error": second.get("error") or first.get("error") or "Canaan work mode command failed.",
+            "firstAttempt": first,
+            "secondAttempt": second,
+        }
+
+    def _apply_fleet_schedule(self, schedule: Dict[str, Any]) -> Dict[str, Any]:
+        target_ip = str(schedule.get("targetIp") or "").strip()
+        target_mac = normalize_mac(schedule.get("targetMac"))
+        action_type = str(schedule.get("actionType") or "").strip().lower()
+        mode_value = str(schedule.get("modeValue") or "").strip().lower()
+        device_type = self._normalize_fleet_device_type(schedule.get("deviceType"))
+        canaan_subtype = ""
+
+        inventory_device = self._find_inventory_device_by_mac_or_ip(target_mac, target_ip, device_type)
+        if inventory_device:
+            inventory_ip = str(inventory_device.get("ip") or "").strip()
+            inventory_mac = normalize_mac(inventory_device.get("mac"))
+            inventory_type = self._normalize_fleet_device_type(inventory_device.get("deviceType"))
+            canaan_subtype = self._normalize_canaan_subtype(inventory_device.get("deviceSubtype"))
+            if inventory_ip:
+                target_ip = inventory_ip
+            if inventory_mac:
+                target_mac = inventory_mac
+            if inventory_type:
+                device_type = inventory_type
+
+        if not target_ip:
+            if target_mac:
+                return {"ok": False, "error": f"Missing target IP for MAC {target_mac}."}
+            return {"ok": False, "error": "Missing target IP."}
+
+        if action_type == "bitaxe_tune":
+            result = self._apply_bitaxe_tune(target_ip, mode_value, target_mac)
+            result["resolvedTargetIp"] = target_ip
+            result["resolvedTargetMac"] = target_mac or None
+            result["resolvedDeviceType"] = device_type or "bitaxe"
+            return result
+        if action_type == "canaan_work_mode":
+            if inventory_device:
+                supported_modes = inventory_device.get("supportedWorkModes")
+                if isinstance(supported_modes, list) and supported_modes:
+                    allowed = {
+                        str(item.get("id") or "").strip()
+                        for item in supported_modes
+                        if isinstance(item, dict)
+                    }
+                    if mode_value not in allowed:
+                        return {
+                            "ok": False,
+                            "error": f"Mode {mode_value} is not supported for {target_ip}.",
+                            "supportedModes": sorted([value for value in allowed if value]),
+                            "resolvedTargetIp": target_ip,
+                            "resolvedTargetMac": target_mac or None,
+                            "resolvedDeviceType": device_type or "canaan",
+                        }
+            mode_device_type = canaan_subtype or device_type
+            result = self._apply_canaan_work_mode(target_ip, mode_device_type, mode_value)
+            result["resolvedTargetIp"] = target_ip
+            result["resolvedTargetMac"] = target_mac or None
+            result["resolvedDeviceType"] = mode_device_type or "canaan"
+            return result
+        return {"ok": False, "error": f"Unsupported action type '{action_type}'."}
+
+    def _run_fleet_manager_if_needed(self) -> None:
+        if not self.experimental_features_enabled:
+            return
+
+        local_now = datetime.now().astimezone()
+        weekday_index = local_now.weekday()  # Monday=0 ... Sunday=6
+        hour = local_now.hour
+        minute = local_now.minute
+        slot_key = local_now.strftime("%Y%m%d-%H%M")
+
+        with self._fleet_lock:
+            schedules = self.fleet_schedules
+            changed = False
+            for schedule in schedules:
+                if not schedule.get("enabled", True):
+                    continue
+                if not self._schedule_includes_weekday(parse_int(schedule.get("daysMask"), default=127, minimum=1, maximum=127), weekday_index):
+                    continue
+                if parse_int(schedule.get("hour"), default=0, minimum=0, maximum=23) != hour:
+                    continue
+                if parse_int(schedule.get("minute"), default=0, minimum=0, maximum=59) != minute:
+                    continue
+                if str(schedule.get("lastTriggeredSlot") or "") == slot_key:
+                    continue
+
+                result = self._apply_fleet_schedule(schedule)
+                resolved_ip = str(result.get("resolvedTargetIp") or "").strip()
+                resolved_mac = normalize_mac(result.get("resolvedTargetMac") or schedule.get("targetMac"))
+                if resolved_ip and schedule.get("targetIp") != resolved_ip:
+                    schedule["targetIp"] = resolved_ip
+                if resolved_mac:
+                    schedule["targetMac"] = resolved_mac
+                schedule["lastTriggeredSlot"] = slot_key
+                schedule["lastTriggeredAtIso"] = now_iso()
+                schedule["lastResult"] = result
+                changed = True
+
+                if result.get("ok") and schedule.get("actionType") == "bitaxe_tune" and resolved_mac:
+                    applied_tune = str(result.get("appliedTuneId") or schedule.get("modeValue") or "").strip().lower()
+                    if applied_tune in BITAXE_TUNE_PRESETS:
+                        self.bitaxe_tune_by_mac[resolved_mac] = applied_tune
+                        for device in self.fleet_inventory:
+                            if normalize_mac(device.get("mac")) == resolved_mac:
+                                device["savedBitaxeTune"] = applied_tune
+
+                if result.get("ok"):
+                    target_label = resolved_ip or str(schedule.get("targetIp") or "unknown")
+                    self._log("fleet", f"Applied schedule '{schedule.get('name', schedule.get('id'))}' to {target_label}.", level="info")
+                else:
+                    self._log("fleet", f"Schedule '{schedule.get('name', schedule.get('id'))}' failed: {result.get('error', 'unknown')}", level="warn")
+
+        if changed:
+            with self.config_lock:
+                self._persist_runtime_config()
+
+    def _restart_paired_miner(self) -> Dict[str, Any]:
+        host = self.bitaxe_host.strip()
+        if not host:
+            return {"ok": False, "error": "No paired miner host configured."}
+
+        restart_paths = ["/api/system/restart", "/system/restart"]
+        last_error = "Unable to restart paired miner."
+        for path in restart_paths:
+            url = f"{self.bitaxe_scheme}://{host}{path}"
+            try:
+                response = self.session.post(url, timeout=max(3.0, float(self.http_timeout_seconds)))
+                if response.ok:
+                    return {
+                        "ok": True,
+                        "action": "restart_paired_miner",
+                        "host": host,
+                        "endpoint": path,
+                        "statusCode": response.status_code,
+                        "message": "Restart command sent to paired miner.",
+                    }
+                last_error = f"Restart endpoint returned HTTP {response.status_code}."
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = str(exc)
+        return {
+            "ok": False,
+            "action": "restart_paired_miner",
+            "host": host,
+            "error": last_error,
+        }
+
+    def _run_automation_if_needed(self) -> None:
+        with self.config_lock:
+            mode = self._normalize_automation_mode(self.automation_mode)
+            profile = self._automation_profile(mode)
+        if not profile.get("autoRecoveryEnabled"):
+            return
+
+        if not self.paired or not self.bitaxe_host.strip():
+            return
+
+        failure_threshold = parse_int(profile.get("failureThreshold"), default=3, minimum=1)
+        cooldown_seconds = parse_int(profile.get("cooldownSeconds"), default=300, minimum=30)
+        now_ts = time.time()
+
+        with self._automation_lock:
+            failures = self._consecutive_poll_failures
+            last_ts = self._last_recovery_attempt_at_ts
+
+        if failures < failure_threshold:
+            return
+        if last_ts is not None and (now_ts - last_ts) < cooldown_seconds:
+            return
+
+        result = self._restart_paired_miner()
+        attempt_iso = now_iso()
+        with self._automation_lock:
+            self._last_recovery_attempt_at_ts = now_ts
+            self._last_recovery_attempt_at_iso = attempt_iso
+            self._last_recovery_result = result
+
+        if result.get("ok"):
+            self._log(
+                "automation",
+                f"{mode}: recovery triggered after {failures} consecutive failures.",
+                level="info",
+            )
+        else:
+            detail = str(result.get("error") or "unknown error")
+            self._log(
+                "automation",
+                f"{mode}: recovery attempt failed after {failures} consecutive failures: {detail}",
+                level="warn",
+            )
 
     def reset_pairing(self) -> Dict[str, Any]:
         with self.config_lock:
@@ -565,7 +1481,7 @@ netplan apply 2>/dev/null || true
                 deb_asset = asset
                 break
 
-        update_available = tag != AGENT_VERSION
+        update_available = is_newer_version(tag, AGENT_VERSION)
         result: Dict[str, Any] = {
             "ok": True,
             "currentVersion": AGENT_VERSION,
@@ -904,6 +1820,37 @@ netplan apply 2>/dev/null || true
                 continue
         return None
 
+    def _run_vcgencmd(self, *args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["vcgencmd", *args],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if result.returncode != 0:
+            return None
+        output = (result.stdout or "").strip()
+        return output or None
+
+    def _core_voltage_v(self) -> Optional[float]:
+        output = self._run_vcgencmd("measure_volts", "core")
+        if not output:
+            return None
+
+        match = re.search(r"(-?\d+(?:\.\d+)?)\s*V", output)
+        if not match:
+            return None
+
+        try:
+            return round(float(match.group(1)), 4)
+        except (TypeError, ValueError):
+            return None
+
     def get_pi_telemetry(self) -> Dict[str, Any]:
         load1, load5, load15 = (None, None, None)
         try:
@@ -924,6 +1871,7 @@ netplan apply 2>/dev/null || true
             "memory": self._memory_telemetry(),
             "diskRoot": self._disk_telemetry(),
             "socTempC": self._soc_temp_c(),
+            "coreVoltageV": self._core_voltage_v(),
             "agentUptimeSeconds": int(time.time() - self.state.started_at),
         }
 
@@ -1207,12 +2155,17 @@ netplan apply 2>/dev/null || true
                 ts_status = tailscale_setup.status()
                 wifi_status = agent.get_wifi_status()
                 led_status = agent.get_led_status()
+                feature_gates = agent.feature_gates_status()
+                local_clock = agent.local_clock_status()
+                fleet_manager = agent.get_fleet_manager_status() if agent.experimental_features_enabled else None
 
                 status = {
                     "ok": True,
                     "agentId": agent.agent_id,
                     "piHostname": agent.pi_hostname,
                     "agentVersion": AGENT_VERSION,
+                    "hubVersion": AGENT_VERSION,
+                    "statusApiVersion": STATUS_API_VERSION,
                     "bitaxeHost": agent.bitaxe_host,
                     "isPaired": agent.paired,
                     "pollSeconds": agent.poll_seconds,
@@ -1225,6 +2178,10 @@ netplan apply 2>/dev/null || true
                     "tailscale": ts_status,
                     "wifi": wifi_status,
                     "statusLed": led_status,
+                    "featureGates": feature_gates,
+                    "hubClock": local_clock,
+                    "automation": agent.get_automation_status() if agent.experimental_features_enabled else None,
+                    "fleetManager": fleet_manager,
                     "currentStep": current_step,
                     **snapshot,
                 }
@@ -1284,6 +2241,28 @@ netplan apply 2>/dev/null || true
                 if parsed.path == "/api/led/status":
                     http_status = 200 if led_status.get("ok") else 503
                     self._send_json(led_status, status=http_status)
+                    return
+
+                if parsed.path == "/api/automation/status":
+                    if not agent.experimental_features_enabled:
+                        self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
+                        return
+                    self._send_json({"ok": True, "automation": agent.get_automation_status()})
+                    return
+
+                if parsed.path == "/api/features/status":
+                    self._send_json({
+                        "ok": True,
+                        "featureGates": agent.feature_gates_status(),
+                        "clock": agent.local_clock_status(),
+                    })
+                    return
+
+                if parsed.path == "/api/fleet/status":
+                    if not agent.experimental_features_enabled:
+                        self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
+                        return
+                    self._send_json({"ok": True, "fleetManager": agent.get_fleet_manager_status()})
                     return
 
                 if parsed.path == "/api/miner/data":
@@ -1448,6 +2427,7 @@ netplan apply 2>/dev/null || true
     <div class="brand-header">
       <img src="/icon.png" alt="HashWatcher" style="width:36px;height:36px;border-radius:8px;">
       <span>HashWatcher Hub Pi</span>
+      <span class="muted" style="font-size:0.72em;font-weight:600;">v{AGENT_VERSION} &middot; API {STATUS_API_VERSION}</span>
       <a href="https://x.com/HashWatcher" target="_blank" title="Follow @HashWatcher on X" style="margin-left:auto;display:inline-flex;align-items:center;color:rgba(255,255,255,0.6);transition:color 0.2s;">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
       </a>
@@ -1474,6 +2454,10 @@ netplan apply 2>/dev/null || true
       <div class="info-row">
         <span class="info-label">Routes</span>
         <code>{ts_routes}</code>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Hub Version</span>
+        <code>v{AGENT_VERSION} &middot; API {STATUS_API_VERSION}</code>
       </div>
       {expiry_banner}
 
@@ -1690,6 +2674,10 @@ netplan apply 2>/dev/null || true
                     "/api/tailscale/down",
                     "/api/tailscale/logout",
                     "/api/led/control",
+                    "/api/features/experimental",
+                    "/api/automation/mode",
+                    "/api/fleet/schedules",
+                    "/api/fleet/inventory",
                     "/api/miner/proxy",
                     "/api/update/apply",
                     "/api/repair",
@@ -1762,6 +2750,35 @@ netplan apply 2>/dev/null || true
                         blink_on_ms = payload.get("blinkOnMs", 250)
                         blink_off_ms = payload.get("blinkOffMs", 250)
                         result = agent.control_led(action, blink_on_ms=blink_on_ms, blink_off_ms=blink_off_ms)
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/features/experimental":
+                        result = agent.set_experimental_features_enabled(payload.get("enabled"))
+                        self._send_json(result, status=200 if result.get("ok") else 400)
+                        return
+                    if parsed.path == "/api/automation/mode":
+                        if not agent.experimental_features_enabled:
+                            self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
+                            return
+                        result = agent.set_automation_mode(payload.get("mode"))
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/fleet/schedules":
+                        if not agent.experimental_features_enabled:
+                            self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
+                            return
+                        result = agent.set_fleet_schedules(payload.get("schedules"))
+                        http_status = 200 if result.get("ok") else 400
+                        self._send_json(result, status=http_status)
+                        return
+                    if parsed.path == "/api/fleet/inventory":
+                        if not agent.experimental_features_enabled:
+                            self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
+                            return
+                        inventory_payload = payload.get("inventory")
+                        result = agent.set_fleet_inventory(inventory_payload)
                         http_status = 200 if result.get("ok") else 400
                         self._send_json(result, status=http_status)
                         return
@@ -1890,12 +2907,26 @@ netplan apply 2>/dev/null || true
                     if result:
                         normalized = self.normalize(result["data"])
                         self.state.set_poll_success({"normalized": normalized, "raw": result["data"]})
+                        with self._automation_lock:
+                            self._consecutive_poll_failures = 0
                     else:
                         msg = f"Miner {self.bitaxe_host} unreachable"
                         self.state.set_poll_error(msg)
+                        with self._automation_lock:
+                            self._consecutive_poll_failures += 1
+                        self._run_automation_if_needed()
                         self._log("poll", msg, level="warn")
+                else:
+                    with self._automation_lock:
+                        self._consecutive_poll_failures = 0
+
+                self._run_fleet_manager_if_needed()
             except Exception as exc:  # pylint: disable=broad-except
                 self.state.set_poll_error(str(exc))
+                with self._automation_lock:
+                    self._consecutive_poll_failures += 1
+                self._run_automation_if_needed()
+                self._run_fleet_manager_if_needed()
                 self._log("poll", str(exc))
 
             time.sleep(self.poll_seconds)

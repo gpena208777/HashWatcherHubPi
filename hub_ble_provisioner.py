@@ -32,6 +32,7 @@ LAST_WIFI_PATH = os.getenv("LAST_WIFI_PATH", "/opt/hashwatcher-hub-pi/last_wifi_
 RUNTIME_PORT_PATH = os.getenv("RUNTIME_PORT_PATH", "/opt/hashwatcher-hub-pi/runtime_port")
 DEFAULT_HUB_PORT = 8787
 WIFI_INTERFACE = os.getenv("WIFI_INTERFACE", "wlan0")
+NMCLI_WAIT_SECONDS = int(os.getenv("NMCLI_WAIT_SECONDS", "60"))
 
 _ble_peripheral: Optional[peripheral.Peripheral] = None
 _ip_status_value: list[int] = list(b"waiting")
@@ -241,6 +242,18 @@ def _short_err(result: subprocess.CompletedProcess, limit: int = 160) -> str:
     return msg[:limit]
 
 
+def _ble_reason(reason: Optional[str]) -> str:
+    """Keep BLE detail notes short and stable for app-side parsing."""
+    text = str(reason or "").lower()
+    if "timeout expired" in text:
+        return "nmcli-timeout"
+    if "secrets were required" in text or "no secrets" in text:
+        return "wifi-auth-failed"
+    if "ssid not found" in text or "not found" in text:
+        return "ssid-not-found"
+    return str(reason or "wifi-apply-failed")[:80]
+
+
 def save_wifi_marker(ssid: str, password: str) -> None:
     payload = {
         "ssid": ssid,
@@ -280,7 +293,7 @@ def apply_wifi_nmcli(ssid: str, password: str) -> tuple[bool, Optional[str]]:
 
     # Remove any existing profile for this SSID so credentials are always fresh.
     safe_shell(["nmcli", "connection", "delete", ssid])
-    cmd = ["nmcli", "--wait", "25", "dev", "wifi", "connect", ssid]
+    cmd = ["nmcli", "--wait", str(NMCLI_WAIT_SECONDS), "dev", "wifi", "connect", ssid]
     if password:
         cmd += ["password", password]
     cmd += ["ifname", WIFI_INTERFACE]
@@ -288,7 +301,7 @@ def apply_wifi_nmcli(ssid: str, password: str) -> tuple[bool, Optional[str]]:
     if result.returncode == 0:
         return True, None
 
-    fallback_cmd = ["nmcli", "--wait", "25", "dev", "wifi", "connect", ssid]
+    fallback_cmd = ["nmcli", "--wait", str(NMCLI_WAIT_SECONDS), "dev", "wifi", "connect", ssid]
     if password:
         fallback_cmd += ["password", password]
     fallback = safe_shell(fallback_cmd)
@@ -339,7 +352,7 @@ def apply_wifi_nmcli(ssid: str, password: str) -> tuple[bool, Optional[str]]:
     if mod_result.returncode != 0:
         return False, f"nmcli:{_short_err(mod_result)}"
 
-    up_result = safe_shell(["nmcli", "--wait", "25", "connection", "up", conn_name])
+    up_result = safe_shell(["nmcli", "--wait", str(NMCLI_WAIT_SECONDS), "connection", "up", conn_name])
     if up_result.returncode == 0:
         return True, None
 
@@ -493,7 +506,7 @@ def on_wifi_write(value: list[int], _options: dict) -> None:
         reason_note = (reason or "apply-failed")
         print(f"[{now_iso()}] Wi-Fi apply failed for SSID '{ssid}': {reason_note}", flush=True)
         emit_pair_status(PAIR_STATUS_WIFI_FAILED)
-        emit_detail_status("wifi-failed", ssid=ssid, note=reason_note)
+        emit_detail_status("wifi-failed", ssid=ssid, note=_ble_reason(reason_note))
         update_ip_status(None)
 
 
@@ -598,7 +611,7 @@ def main() -> None:
         else:
             reason_note = reason or "boot-reconnect-failed"
             print(f"[{now_iso()}] Boot reconnect apply failed for SSID '{ssid}': {reason_note}", flush=True)
-            emit_detail_status("wifi-failed", ssid=ssid, note=reason_note)
+            emit_detail_status("wifi-failed", ssid=ssid, note=_ble_reason(reason_note))
 
     threading.Thread(target=_reconnect_saved_wifi, daemon=True).start()
 
