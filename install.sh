@@ -63,6 +63,7 @@ required_files=(
     hashwatcher_hub_agent.py
     hub_ble_provisioner.py
     tailscale_setup.py
+    ota_update_helper.sh
     requirements.txt
     hashwatcher-hub.service
     hashwatcher-ble-provisioner.service
@@ -223,6 +224,7 @@ EOF
     for f in hashwatcher_hub_agent.py hub_ble_provisioner.py tailscale_setup.py requirements.txt; do
         install -m 0644 "${src}/${f}" "${INSTALL_DIR}/${f}"
     done
+    install -m 0755 "${src}/ota_update_helper.sh" "${INSTALL_DIR}/ota_update_helper.sh"
 
     install -m 0644 "${src}/VERSION" "${INSTALL_DIR}/VERSION"
 
@@ -271,8 +273,10 @@ hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/reboot
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/sysctl -w *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/vcgencmd *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit hashwatcher-hub-update --collect --service-type=oneshot /opt/hashwatcher-hub-pi/ota_update_helper.sh *
 EOF
     chmod 0440 /etc/sudoers.d/hashwatcher-hub-pi
 

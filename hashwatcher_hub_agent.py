@@ -46,31 +46,6 @@ AGENT_VERSION = resolve_agent_version()
 STATUS_API_VERSION = "1"
 GITHUB_REPO = "gpena208777/HashWatcherHubPi"
 
-HUB_AUTOMATION_PROFILES: Dict[str, Dict[str, Any]] = {
-    "monitor_only": {
-        "label": "Monitor Only",
-        "description": "Track miner health and alerts only. No automatic recovery actions.",
-        "autoRecoveryEnabled": False,
-        "failureThreshold": None,
-        "cooldownSeconds": None,
-    },
-    "auto_recover": {
-        "label": "Auto Recover",
-        "description": "Restart the paired miner when repeated network failures are detected.",
-        "autoRecoveryEnabled": True,
-        "failureThreshold": 3,
-        "cooldownSeconds": 300,
-    },
-    "aggressive_recover": {
-        "label": "Aggressive Recover",
-        "description": "Faster recovery attempts for unstable networks with shorter trigger and cooldown windows.",
-        "autoRecoveryEnabled": True,
-        "failureThreshold": 2,
-        "cooldownSeconds": 120,
-    },
-}
-DEFAULT_AUTOMATION_MODE = "monitor_only"
-
 BITAXE_TUNE_PRESETS: Dict[str, Dict[str, Any]] = {
     "stock": {"label": "Stock", "frequency": 600, "coreVoltage": 1150},
     "mild_oc": {"label": "Mild OC", "frequency": 605, "coreVoltage": 1150},
@@ -240,6 +215,9 @@ class HubAgent:
         self.status_http_bind = env_str("STATUS_HTTP_BIND", "0.0.0.0")
         self.status_http_port = max(1, env_int("STATUS_HTTP_PORT", 8787))
         self.runtime_config_path = env_str("RUNTIME_CONFIG_PATH", "/opt/hashwatcher-hub-pi/runtime_config.json")
+        self.update_progress_path = env_str("UPDATE_PROGRESS_PATH", "/opt/hashwatcher-hub-pi/updates/update-progress.json")
+        self.update_helper_path = env_str("UPDATE_HELPER_PATH", "/opt/hashwatcher-hub-pi/ota_update_helper.sh")
+        self.update_unit_name = env_str("UPDATE_UNIT_NAME", "hashwatcher-hub-update")
 
         self.agent_id = env_str("AGENT_ID", socket.gethostname())
         self.paired_device_type = ""
@@ -247,14 +225,12 @@ class HubAgent:
         self.paired_miner_hostname = ""
         self.paired = bool(self.bitaxe_host.strip())
         self.user_subnet_cidr = ""
-        self.automation_mode = DEFAULT_AUTOMATION_MODE
         self.experimental_features_enabled = False
         self.fleet_schedules: List[Dict[str, Any]] = []
         self.fleet_inventory: List[Dict[str, Any]] = []
         self.bitaxe_tune_by_mac: Dict[str, str] = {}
 
         self.config_lock = threading.Lock()
-        self._automation_lock = threading.Lock()
         self._fleet_lock = threading.Lock()
         self._load_runtime_config()
         self._cpu_prev_total = 0
@@ -266,17 +242,14 @@ class HubAgent:
 
         self.session = requests.Session()
         self.state = HubState()
-        self._update_progress: Dict[str, Any] = {"stage": "idle"}
+        self._update_lock = threading.Lock()
+        self._update_progress: Dict[str, Any] = self._read_update_progress() or {"stage": "idle"}
         self._led_lock = threading.Lock()
         self._led_default_trigger: Optional[str] = None
 
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
         self._max_log_entries = 200
-        self._consecutive_poll_failures = 0
-        self._last_recovery_attempt_at_iso: Optional[str] = None
-        self._last_recovery_attempt_at_ts: Optional[float] = None
-        self._last_recovery_result: Optional[Dict[str, Any]] = None
 
     def _log(self, source: str, message: str, level: str = "error") -> None:
         entry: Dict[str, Any] = {
@@ -305,7 +278,6 @@ class HubAgent:
             paired_miner_hostname = str(cfg.get("minerHostname", "")).strip()
             paired_flag = cfg.get("paired")
             user_subnet_cidr = str(cfg.get("userSubnetCIDR", "")).strip()
-            automation_mode = str(cfg.get("automationMode", DEFAULT_AUTOMATION_MODE)).strip()
             experimental_features_enabled = bool(cfg.get("experimentalFeaturesEnabled", False))
             fleet_schedules = cfg.get("fleetSchedules", [])
             fleet_inventory = cfg.get("fleetInventory", [])
@@ -329,7 +301,6 @@ class HubAgent:
                 self.paired = bool(self.bitaxe_host.strip())
             if user_subnet_cidr:
                 self.user_subnet_cidr = user_subnet_cidr
-            self.automation_mode = self._normalize_automation_mode(automation_mode)
             self.experimental_features_enabled = bool(experimental_features_enabled)
             if isinstance(fleet_schedules, list):
                 normalized = [self._normalize_fleet_schedule(item) for item in fleet_schedules]
@@ -359,7 +330,6 @@ class HubAgent:
             "minerHostname": self.paired_miner_hostname,
             "paired": self.paired,
             "userSubnetCIDR": self.user_subnet_cidr,
-            "automationMode": self.automation_mode,
             "experimentalFeaturesEnabled": self.experimental_features_enabled,
             "fleetSchedules": self.fleet_schedules,
             "fleetInventory": self.fleet_inventory,
@@ -373,6 +343,29 @@ class HubAgent:
             os.chmod(self.runtime_config_path, 0o600)
         except Exception:
             pass
+
+    def _read_update_progress(self) -> Optional[Dict[str, Any]]:
+        try:
+            with open(self.update_progress_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    def _set_update_progress(self, progress: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(progress)
+        payload["updatedAtIso"] = now_iso()
+        with self._update_lock:
+            self._update_progress = payload
+        try:
+            os.makedirs(os.path.dirname(self.update_progress_path), exist_ok=True)
+            tmp_path = f"{self.update_progress_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, self.update_progress_path)
+        except Exception:
+            pass
+        return payload
 
     def get_wifi_status(self) -> Dict[str, Any]:
         """Return real Wi-Fi connection state from wlan0."""
@@ -424,6 +417,8 @@ class HubAgent:
         ts_authenticated = ts_status.get("authenticated", False)
         wifi = self.get_wifi_status()
         wifi_connected = wifi.get("connected", False)
+        routes_approved = ts_status.get("routesApproved", False)
+        routes_pending = ts_status.get("routesPending", False)
 
         step_num = 1
         step_name = "Connect to Wi-Fi"
@@ -434,6 +429,13 @@ class HubAgent:
             step_num = 2
             step_name = "Set up Tailscale"
             step_detail = f"Wi-Fi connected ({wifi.get('ssid', '?')}). Provide a Tailscale auth key to enable remote access. Generate one at login.tailscale.com \u2192 Settings \u2192 Keys."
+        elif not routes_approved:
+            step_num = 3
+            step_name = "Approve Subnet Route"
+            if routes_pending:
+                step_detail = "Tailscale is connected, but subnet routing is still waiting for approval in the Tailscale admin console."
+            else:
+                step_detail = "Tailscale is connected. Approve subnet routing so devices on your LAN are reachable remotely."
         else:
             step_num = 3
             step_name = "Ready"
@@ -446,6 +448,21 @@ class HubAgent:
             "totalSteps": 3,
         }
 
+    def is_setup_complete(
+        self,
+        wifi_status: Optional[Dict[str, Any]] = None,
+        ts_status: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        wifi = wifi_status if wifi_status is not None else self.get_wifi_status()
+        ts = ts_status if ts_status is not None else tailscale_setup.status()
+        return bool(
+            wifi.get("connected", False)
+            and ts.get("authenticated", False)
+            and ts.get("online", False)
+            and ts.get("routesApproved", False)
+            and not ts.get("keyExpired", False)
+        )
+
     def get_runtime_config(self) -> Dict[str, Any]:
         with self.config_lock:
             return {
@@ -457,7 +474,6 @@ class HubAgent:
                 "minerHostname": self.paired_miner_hostname,
                 "paired": self.paired,
                 "userSubnetCIDR": self.user_subnet_cidr,
-                "automationMode": self.automation_mode,
                 "experimentalFeaturesEnabled": self.experimental_features_enabled,
                 "fleetSchedules": self.fleet_schedules,
                 "fleetInventory": self.fleet_inventory,
@@ -489,75 +505,9 @@ class HubAgent:
                 self.paired_miner_hostname = str(updates.get("minerHostname") or "").strip()
             if "paired" in updates:
                 self.paired = bool(updates.get("paired"))
-            if "automationMode" in updates:
-                self.automation_mode = self._normalize_automation_mode(updates.get("automationMode"))
 
             self._persist_runtime_config()
             return self.get_runtime_config()
-
-    def _normalize_automation_mode(self, value: Any) -> str:
-        mode = str(value or "").strip().lower()
-        if mode in HUB_AUTOMATION_PROFILES:
-            return mode
-        return DEFAULT_AUTOMATION_MODE
-
-    def _automation_profile(self, mode: Optional[str] = None) -> Dict[str, Any]:
-        mode_value = self._normalize_automation_mode(mode or self.automation_mode)
-        return HUB_AUTOMATION_PROFILES[mode_value]
-
-    def get_automation_status(self) -> Dict[str, Any]:
-        with self.config_lock:
-            mode = self._normalize_automation_mode(self.automation_mode)
-            profile = self._automation_profile(mode)
-        with self._automation_lock:
-            failures = self._consecutive_poll_failures
-            last_attempt_iso = self._last_recovery_attempt_at_iso
-            last_result = dict(self._last_recovery_result) if isinstance(self._last_recovery_result, dict) else None
-        return {
-            "mode": mode,
-            "modeLabel": profile["label"],
-            "description": profile["description"],
-            "autoRecoveryEnabled": profile["autoRecoveryEnabled"],
-            "failureThreshold": profile["failureThreshold"],
-            "cooldownSeconds": profile["cooldownSeconds"],
-            "consecutiveFailures": failures,
-            "lastRecoveryAttemptAtIso": last_attempt_iso,
-            "lastRecovery": last_result,
-            "supportedModes": [
-                {
-                    "id": mode_id,
-                    "label": cfg["label"],
-                    "description": cfg["description"],
-                }
-                for mode_id, cfg in HUB_AUTOMATION_PROFILES.items()
-            ],
-        }
-
-    def set_automation_mode(self, mode: Any) -> Dict[str, Any]:
-        if not self.experimental_features_enabled:
-            return {
-                "ok": False,
-                "error": "Experimental features are disabled.",
-            }
-        requested = str(mode or "").strip().lower()
-        if requested not in HUB_AUTOMATION_PROFILES:
-            return {
-                "ok": False,
-                "error": f"Invalid automation mode '{requested or 'empty'}'.",
-                "supportedModes": list(HUB_AUTOMATION_PROFILES.keys()),
-            }
-        normalized = requested
-        with self.config_lock:
-            self.automation_mode = normalized
-            self._persist_runtime_config()
-        with self._automation_lock:
-            self._consecutive_poll_failures = 0
-        status = self.get_automation_status()
-        return {
-            "ok": True,
-            "message": f"Automation mode set to {status['modeLabel']}.",
-            "automation": status,
-        }
 
     def set_experimental_features_enabled(self, enabled: Any) -> Dict[str, Any]:
         with self.config_lock:
@@ -803,8 +753,6 @@ class HubAgent:
                 item["supportedWorkModes"] = self._normalize_canaan_mode_options(item.get("supportedWorkModes"), subtype)
 
     def set_fleet_inventory(self, devices: Any) -> Dict[str, Any]:
-        if not self.experimental_features_enabled:
-            return {"ok": False, "error": "Experimental features are disabled."}
         if not isinstance(devices, list):
             return {"ok": False, "error": "inventory must be an array."}
 
@@ -950,8 +898,6 @@ class HubAgent:
         }
 
     def set_fleet_schedules(self, schedules: Any) -> Dict[str, Any]:
-        if not self.experimental_features_enabled:
-            return {"ok": False, "error": "Experimental features are disabled."}
         if not isinstance(schedules, list):
             return {"ok": False, "error": "schedules must be an array."}
 
@@ -1134,9 +1080,6 @@ class HubAgent:
         return {"ok": False, "error": f"Unsupported action type '{action_type}'."}
 
     def _run_fleet_manager_if_needed(self) -> None:
-        if not self.experimental_features_enabled:
-            return
-
         local_now = datetime.now().astimezone()
         weekday_index = local_now.weekday()  # Monday=0 ... Sunday=6
         hour = local_now.hour
@@ -1187,80 +1130,6 @@ class HubAgent:
         if changed:
             with self.config_lock:
                 self._persist_runtime_config()
-
-    def _restart_paired_miner(self) -> Dict[str, Any]:
-        host = self.bitaxe_host.strip()
-        if not host:
-            return {"ok": False, "error": "No paired miner host configured."}
-
-        restart_paths = ["/api/system/restart", "/system/restart"]
-        last_error = "Unable to restart paired miner."
-        for path in restart_paths:
-            url = f"{self.bitaxe_scheme}://{host}{path}"
-            try:
-                response = self.session.post(url, timeout=max(3.0, float(self.http_timeout_seconds)))
-                if response.ok:
-                    return {
-                        "ok": True,
-                        "action": "restart_paired_miner",
-                        "host": host,
-                        "endpoint": path,
-                        "statusCode": response.status_code,
-                        "message": "Restart command sent to paired miner.",
-                    }
-                last_error = f"Restart endpoint returned HTTP {response.status_code}."
-            except Exception as exc:  # pylint: disable=broad-except
-                last_error = str(exc)
-        return {
-            "ok": False,
-            "action": "restart_paired_miner",
-            "host": host,
-            "error": last_error,
-        }
-
-    def _run_automation_if_needed(self) -> None:
-        with self.config_lock:
-            mode = self._normalize_automation_mode(self.automation_mode)
-            profile = self._automation_profile(mode)
-        if not profile.get("autoRecoveryEnabled"):
-            return
-
-        if not self.paired or not self.bitaxe_host.strip():
-            return
-
-        failure_threshold = parse_int(profile.get("failureThreshold"), default=3, minimum=1)
-        cooldown_seconds = parse_int(profile.get("cooldownSeconds"), default=300, minimum=30)
-        now_ts = time.time()
-
-        with self._automation_lock:
-            failures = self._consecutive_poll_failures
-            last_ts = self._last_recovery_attempt_at_ts
-
-        if failures < failure_threshold:
-            return
-        if last_ts is not None and (now_ts - last_ts) < cooldown_seconds:
-            return
-
-        result = self._restart_paired_miner()
-        attempt_iso = now_iso()
-        with self._automation_lock:
-            self._last_recovery_attempt_at_ts = now_ts
-            self._last_recovery_attempt_at_iso = attempt_iso
-            self._last_recovery_result = result
-
-        if result.get("ok"):
-            self._log(
-                "automation",
-                f"{mode}: recovery triggered after {failures} consecutive failures.",
-                level="info",
-            )
-        else:
-            detail = str(result.get("error") or "unknown error")
-            self._log(
-                "automation",
-                f"{mode}: recovery attempt failed after {failures} consecutive failures: {detail}",
-                level="warn",
-            )
 
     def reset_pairing(self) -> Dict[str, Any]:
         with self.config_lock:
@@ -1463,8 +1332,13 @@ netplan apply 2>/dev/null || true
         url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
             resp = requests.get(url, timeout=15, headers={"Accept": "application/vnd.github+json"})
-            if resp.status_code == 404:
-                return {"ok": True, "updateAvailable": False, "reason": "no releases published yet", "currentVersion": AGENT_VERSION}
+            if resp.status_code in (401, 403, 404):
+                return {
+                    "ok": True,
+                    "updateAvailable": False,
+                    "reason": "no update available",
+                    "currentVersion": AGENT_VERSION,
+                }
             resp.raise_for_status()
             release = resp.json()
         except Exception as exc:
@@ -1500,12 +1374,25 @@ netplan apply 2>/dev/null || true
         return result
 
     def get_update_progress(self) -> Dict[str, Any]:
-        return dict(self._update_progress)
+        disk_progress = self._read_update_progress()
+        with self._update_lock:
+            memory_progress = dict(self._update_progress)
+        if not disk_progress:
+            return memory_progress
+
+        disk_updated = str(disk_progress.get("updatedAtIso", ""))
+        memory_updated = str(memory_progress.get("updatedAtIso", ""))
+        if disk_updated >= memory_updated:
+            with self._update_lock:
+                self._update_progress = dict(disk_progress)
+            return disk_progress
+        return memory_progress
 
     def apply_update(self) -> Dict[str, Any]:
         """Start background download and install of the latest .deb from GitHub."""
-        if self._update_progress.get("stage") in ("downloading", "installing", "restarting"):
-            return {"ok": True, "message": "Update already in progress.", **self._update_progress}
+        current_progress = self.get_update_progress()
+        if current_progress.get("stage") in ("downloading", "installing", "restarting"):
+            return {"ok": True, "message": "Update already in progress.", **current_progress}
 
         check = self.check_for_update()
         if not check.get("ok"):
@@ -1517,12 +1404,12 @@ netplan apply 2>/dev/null || true
         if not deb_info or not deb_info.get("downloadUrl"):
             return {"ok": False, "error": "No .deb asset found in the latest release"}
 
-        self._update_progress = {
+        self._set_update_progress({
             "stage": "downloading",
             "percent": 0,
             "version": check["latestVersion"],
             "message": "Starting download...",
-        }
+        })
 
         def _run_update() -> None:
             download_url = deb_info["downloadUrl"]
@@ -1543,54 +1430,59 @@ netplan apply 2>/dev/null || true
                             sha.update(chunk)
                             downloaded += len(chunk)
                             pct = int(downloaded * 100 / total_size) if total_size > 0 else 0
-                            self._update_progress = {
+                            self._set_update_progress({
                                 "stage": "downloading",
                                 "percent": min(pct, 100),
                                 "version": check["latestVersion"],
                                 "message": f"Downloaded {downloaded // 1024} KB" + (f" / {total_size // 1024} KB" if total_size else ""),
-                            }
+                            })
             except Exception as exc:
-                self._update_progress = {"stage": "failed", "percent": 0, "error": f"Download failed: {exc}"}
+                self._set_update_progress({"stage": "failed", "percent": 0, "error": f"Download failed: {exc}"})
                 return
 
-            self._update_progress = {
+            progress = self._set_update_progress({
                 "stage": "installing",
                 "percent": 100,
                 "version": check["latestVersion"],
                 "message": "Installing package...",
-            }
+                "previousVersion": AGENT_VERSION,
+                "sha256": sha.hexdigest(),
+            })
 
             try:
                 result = subprocess.run(
-                    ["sudo", "dpkg", "-i", deb_path],
-                    capture_output=True, text=True, timeout=60,
+                    [
+                        "sudo",
+                        "/usr/bin/systemd-run",
+                        "--unit",
+                        self.update_unit_name,
+                        "--collect",
+                        "--service-type=oneshot",
+                        self.update_helper_path,
+                        deb_path,
+                        check["latestVersion"],
+                        AGENT_VERSION,
+                        sha.hexdigest(),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
                 )
                 if result.returncode != 0:
                     stderr = result.stderr.strip() or result.stdout.strip()
-                    self._update_progress = {"stage": "failed", "percent": 0, "error": f"dpkg install failed: {stderr}"}
+                    self._set_update_progress({"stage": "failed", "percent": 0, "error": f"update handoff failed: {stderr}"})
                     return
             except Exception as exc:
-                self._update_progress = {"stage": "failed", "percent": 0, "error": f"Install failed: {exc}"}
+                self._set_update_progress({"stage": "failed", "percent": 0, "error": f"Install failed: {exc}"})
                 return
 
-            self._update_progress = {
-                "stage": "restarting",
-                "percent": 100,
-                "version": check["latestVersion"],
-                "message": f"Updated to {check['latestVersion']}. Restarting...",
-                "previousVersion": AGENT_VERSION,
-                "sha256": sha.hexdigest(),
-            }
-
-            time.sleep(2)
-            try:
-                subprocess.run(["sudo", "systemctl", "restart", "hashwatcher-hub-pi"],
-                               capture_output=True, text=True, timeout=15)
-            except Exception:
-                pass
+            self._set_update_progress({
+                **progress,
+                "message": "Installer launched. Waiting for restart...",
+            })
 
         threading.Thread(target=_run_update, daemon=True).start()
-        return {"ok": True, "message": "Update started.", **self._update_progress}
+        return {"ok": True, "message": "Update started.", **self.get_update_progress()}
 
     def _bitaxe_url(self, host: str, endpoint: str) -> str:
         return f"{self.bitaxe_scheme}://{host}{endpoint}"
@@ -1821,21 +1713,29 @@ netplan apply 2>/dev/null || true
         return None
 
     def _run_vcgencmd(self, *args: str) -> Optional[str]:
-        try:
-            result = subprocess.run(
-                ["vcgencmd", *args],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-        except Exception:
-            return None
+        commands = [
+            ["sudo", "-n", "/usr/bin/vcgencmd", *args],
+            ["/usr/bin/vcgencmd", *args],
+            ["vcgencmd", *args],
+        ]
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+            except Exception:
+                continue
 
-        if result.returncode != 0:
-            return None
-        output = (result.stdout or "").strip()
-        return output or None
+            if result.returncode != 0:
+                continue
+            output = (result.stdout or "").strip()
+            if output:
+                return output
+        return None
 
     def _core_voltage_v(self) -> Optional[float]:
         output = self._run_vcgencmd("measure_volts", "core")
@@ -1850,6 +1750,50 @@ netplan apply 2>/dev/null || true
             return round(float(match.group(1)), 4)
         except (TypeError, ValueError):
             return None
+
+    def _arm_clock_mhz(self) -> Optional[int]:
+        output = self._run_vcgencmd("measure_clock", "arm")
+        if not output:
+            return None
+
+        match = re.search(r"=\s*(\d+)", output)
+        if not match:
+            match = re.search(r"(\d+)\s*$", output)
+        if not match:
+            return None
+
+        try:
+            hz = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+        if hz <= 0:
+            return None
+        return int(round(hz / 1_000_000.0))
+
+    def _max_arm_clock_mhz(self) -> Optional[int]:
+        output = self._run_vcgencmd("get_config", "arm_freq")
+        if output:
+            match = re.search(r"arm_freq\s*=\s*(\d+)", output)
+            if match:
+                try:
+                    mhz = int(match.group(1))
+                    if mhz > 0:
+                        return mhz
+                except (TypeError, ValueError):
+                    pass
+
+        max_freq_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
+        try:
+            raw = _read_text(max_freq_path)
+            if raw:
+                khz = int(raw.strip())
+                if khz > 0:
+                    return int(round(khz / 1000.0))
+        except Exception:
+            pass
+
+        return None
 
     def get_pi_telemetry(self) -> Dict[str, Any]:
         load1, load5, load15 = (None, None, None)
@@ -1871,6 +1815,8 @@ netplan apply 2>/dev/null || true
             "memory": self._memory_telemetry(),
             "diskRoot": self._disk_telemetry(),
             "socTempC": self._soc_temp_c(),
+            "armClockMHz": self._arm_clock_mhz(),
+            "maxArmClockMHz": self._max_arm_clock_mhz(),
             "coreVoltageV": self._core_voltage_v(),
             "agentUptimeSeconds": int(time.time() - self.state.started_at),
         }
@@ -2157,7 +2103,9 @@ netplan apply 2>/dev/null || true
                 led_status = agent.get_led_status()
                 feature_gates = agent.feature_gates_status()
                 local_clock = agent.local_clock_status()
-                fleet_manager = agent.get_fleet_manager_status() if agent.experimental_features_enabled else None
+                fleet_manager = agent.get_fleet_manager_status()
+
+                setup_complete = agent.is_setup_complete(wifi_status, ts_status)
 
                 status = {
                     "ok": True,
@@ -2167,7 +2115,8 @@ netplan apply 2>/dev/null || true
                     "hubVersion": AGENT_VERSION,
                     "statusApiVersion": STATUS_API_VERSION,
                     "bitaxeHost": agent.bitaxe_host,
-                    "isPaired": agent.paired,
+                    "isPaired": setup_complete,
+                    "setupComplete": setup_complete,
                     "pollSeconds": agent.poll_seconds,
                     "statusHttpPort": agent.status_http_port,
                     "pairedDeviceType": agent.paired_device_type or None,
@@ -2180,7 +2129,6 @@ netplan apply 2>/dev/null || true
                     "statusLed": led_status,
                     "featureGates": feature_gates,
                     "hubClock": local_clock,
-                    "automation": agent.get_automation_status() if agent.experimental_features_enabled else None,
                     "fleetManager": fleet_manager,
                     "currentStep": current_step,
                     **snapshot,
@@ -2243,13 +2191,6 @@ netplan apply 2>/dev/null || true
                     self._send_json(led_status, status=http_status)
                     return
 
-                if parsed.path == "/api/automation/status":
-                    if not agent.experimental_features_enabled:
-                        self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
-                        return
-                    self._send_json({"ok": True, "automation": agent.get_automation_status()})
-                    return
-
                 if parsed.path == "/api/features/status":
                     self._send_json({
                         "ok": True,
@@ -2259,9 +2200,6 @@ netplan apply 2>/dev/null || true
                     return
 
                 if parsed.path == "/api/fleet/status":
-                    if not agent.experimental_features_enabled:
-                        self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
-                        return
                     self._send_json({"ok": True, "fleetManager": agent.get_fleet_manager_status()})
                     return
 
@@ -2675,7 +2613,6 @@ netplan apply 2>/dev/null || true
                     "/api/tailscale/logout",
                     "/api/led/control",
                     "/api/features/experimental",
-                    "/api/automation/mode",
                     "/api/fleet/schedules",
                     "/api/fleet/inventory",
                     "/api/miner/proxy",
@@ -2757,26 +2694,12 @@ netplan apply 2>/dev/null || true
                         result = agent.set_experimental_features_enabled(payload.get("enabled"))
                         self._send_json(result, status=200 if result.get("ok") else 400)
                         return
-                    if parsed.path == "/api/automation/mode":
-                        if not agent.experimental_features_enabled:
-                            self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
-                            return
-                        result = agent.set_automation_mode(payload.get("mode"))
-                        http_status = 200 if result.get("ok") else 400
-                        self._send_json(result, status=http_status)
-                        return
                     if parsed.path == "/api/fleet/schedules":
-                        if not agent.experimental_features_enabled:
-                            self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
-                            return
                         result = agent.set_fleet_schedules(payload.get("schedules"))
                         http_status = 200 if result.get("ok") else 400
                         self._send_json(result, status=http_status)
                         return
                     if parsed.path == "/api/fleet/inventory":
-                        if not agent.experimental_features_enabled:
-                            self._send_json({"ok": False, "error": "Experimental features are disabled."}, status=403)
-                            return
                         inventory_payload = payload.get("inventory")
                         result = agent.set_fleet_inventory(inventory_payload)
                         http_status = 200 if result.get("ok") else 400
@@ -2907,25 +2830,14 @@ netplan apply 2>/dev/null || true
                     if result:
                         normalized = self.normalize(result["data"])
                         self.state.set_poll_success({"normalized": normalized, "raw": result["data"]})
-                        with self._automation_lock:
-                            self._consecutive_poll_failures = 0
                     else:
                         msg = f"Miner {self.bitaxe_host} unreachable"
                         self.state.set_poll_error(msg)
-                        with self._automation_lock:
-                            self._consecutive_poll_failures += 1
-                        self._run_automation_if_needed()
                         self._log("poll", msg, level="warn")
-                else:
-                    with self._automation_lock:
-                        self._consecutive_poll_failures = 0
 
                 self._run_fleet_manager_if_needed()
             except Exception as exc:  # pylint: disable=broad-except
                 self.state.set_poll_error(str(exc))
-                with self._automation_lock:
-                    self._consecutive_poll_failures += 1
-                self._run_automation_if_needed()
                 self._run_fleet_manager_if_needed()
                 self._log("poll", str(exc))
 
