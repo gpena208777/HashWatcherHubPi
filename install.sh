@@ -139,6 +139,16 @@ install_latest_release_deb() {
     info "Downloading latest release package..."
     curl -fsSL "${deb_url}" -o "${deb_path}"
 
+    if ! command -v tailscale >/dev/null 2>&1; then
+        info "Installing Tailscale before package install..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    else
+        ok "Tailscale already installed."
+    fi
+    if systemctl list-unit-files tailscaled.service >/dev/null 2>&1; then
+        systemctl enable tailscaled --now 2>/dev/null || true
+    fi
+
     info "Installing latest release package..."
     apt-get update -qq
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${deb_path}"; then
