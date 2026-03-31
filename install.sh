@@ -35,6 +35,146 @@ info()  { echo -e "${CYAN}[HashWatcher]${NC} $*"; }
 ok()    { echo -e "${GREEN}[HashWatcher]${NC} $*"; }
 fail()  { echo -e "${RED}[HashWatcher]${NC} $*" >&2; exit 1; }
 
+clock_now_epoch() {
+    date -u +%s 2>/dev/null || echo 0
+}
+
+fetch_https_date_epoch() {
+    local url="$1"
+    local date_header
+
+    date_header="$(
+        curl -fsSI --max-time 15 "${url}" 2>/dev/null |
+        awk 'BEGIN{IGNORECASE=1} /^date:/ {sub(/\r$/, "", $0); print substr($0, 7); exit}'
+    )"
+    [[ -n "${date_header}" ]] || return 1
+
+    HTTPS_DATE_HEADER="${date_header}" python3 - <<'PY'
+import email.utils
+import os
+import sys
+
+value = os.environ.get("HTTPS_DATE_HEADER", "").strip()
+if not value:
+    raise SystemExit(1)
+dt = email.utils.parsedate_to_datetime(value)
+print(int(dt.timestamp()))
+PY
+}
+
+wait_for_ntp_sync() {
+    local attempts="${1:-20}"
+    local delay_seconds="${2:-2}"
+    local synced=""
+    local i
+
+    if ! command -v timedatectl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    for i in $(seq 1 "${attempts}"); do
+        synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+        if [[ "${synced}" == "yes" ]]; then
+            return 0
+        fi
+        sleep "${delay_seconds}"
+    done
+
+    return 1
+}
+
+try_enable_time_sync() {
+    if ! command -v timedatectl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+
+    if systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1; then
+        systemctl restart systemd-timesyncd.service >/dev/null 2>&1 || true
+    fi
+
+    wait_for_ntp_sync 15 2
+}
+
+set_clock_from_https_date() {
+    local current_epoch remote_epoch source_url delta
+
+    current_epoch="$(clock_now_epoch)"
+
+    for source_url in \
+        "https://api.github.com" \
+        "https://github.com" \
+        "https://pkgs.tailscale.com" \
+        "https://deb.debian.org"
+    do
+        remote_epoch="$(fetch_https_date_epoch "${source_url}" || true)"
+        [[ -n "${remote_epoch}" ]] || continue
+        delta=$(( remote_epoch - current_epoch ))
+        if (( delta > 60 )); then
+            info "Pi clock is behind by about ${delta}s; setting time from ${source_url}."
+            date -u -s "@${remote_epoch}" >/dev/null 2>&1 || return 1
+            return 0
+        fi
+        if (( delta >= -60 )); then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ensure_clock_is_sane() {
+    info "Checking Pi clock before package operations..."
+    if try_enable_time_sync; then
+        ok "NTP time sync is active."
+        return 0
+    fi
+
+    if set_clock_from_https_date; then
+        ok "Adjusted Pi clock from HTTPS response headers."
+        return 0
+    fi
+
+    info "Clock sync could not be confirmed yet; continuing and watching for apt signature timing errors."
+    return 1
+}
+
+apt_update_with_clock_recovery() {
+    local apt_output status
+
+    set +e
+    apt_output="$(apt-get update -qq 2>&1)"
+    status=$?
+    set -e
+
+    if [[ ${status} -eq 0 ]] && ! grep -q "Not live until" <<<"${apt_output}"; then
+        return 0
+    fi
+
+    if grep -q "Not live until" <<<"${apt_output}"; then
+        info "apt repository signatures are not valid yet for the Pi clock; retrying after a clock sync."
+        ensure_clock_is_sane || true
+
+        set +e
+        apt_output="$(apt-get update -qq 2>&1)"
+        status=$?
+        set -e
+    fi
+
+    if [[ ${status} -ne 0 ]]; then
+        printf '%s\n' "${apt_output}" >&2
+        return "${status}"
+    fi
+
+    if grep -q "Not live until" <<<"${apt_output}"; then
+        printf '%s\n' "${apt_output}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 is_rootfs_read_only() {
     local mount_opts
     mount_opts="$(findmnt -no OPTIONS / 2>/dev/null || true)"
@@ -136,6 +276,8 @@ install_latest_release_deb() {
     local installed_version
     local installed_status
 
+    ensure_clock_is_sane || true
+
     info "Downloading latest release package..."
     curl -fsSL "${deb_url}" -o "${deb_path}"
 
@@ -150,7 +292,7 @@ install_latest_release_deb() {
     fi
 
     info "Installing latest release package..."
-    apt-get update -qq
+    apt_update_with_clock_recovery || fail "Package index update failed, likely because the Pi clock is still incorrect."
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${deb_path}"; then
         fail "Package install failed during apt/dpkg configure step."
     fi
@@ -193,6 +335,8 @@ install_from_source() {
     info "Installing from source: ${src}"
     echo ""
 
+    ensure_clock_is_sane || true
+
     for pkg in "${required_packages[@]}"; do
         if ! package_installed "${pkg}"; then
             missing_packages+=("${pkg}")
@@ -201,7 +345,7 @@ install_from_source() {
 
     if ((${#missing_packages[@]} > 0)); then
         info "Installing missing system packages: ${missing_packages[*]}"
-        apt-get update -qq
+        apt_update_with_clock_recovery || fail "Package index update failed, likely because the Pi clock is still incorrect."
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing_packages[@]}"
     else
         ok "Required system packages already installed."
