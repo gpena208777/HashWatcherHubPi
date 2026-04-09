@@ -319,6 +319,17 @@ append_config_if_missing() {
     fi
 }
 
+venv_has_requirements() {
+    "${VENV_DIR}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+required = ("requests", "dotenv", "bluezero", "dbus")
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+sys.exit(0 if not missing else 1)
+PY
+}
+
 install_from_source() {
     local src="$1"
     local current_hostname
@@ -411,10 +422,10 @@ EOF
         venv_created=1
     fi
 
-    if [[ "${current_req_hash}" != "${saved_req_hash}" || "${venv_created}" -eq 1 ]]; then
+    if [[ "${current_req_hash}" != "${saved_req_hash}" || "${venv_created}" -eq 1 ]] || ! venv_has_requirements; then
         info "Installing Python dependencies..."
-        "${VENV_DIR}/bin/pip" install --upgrade pip -q
-        "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q
+        "${VENV_DIR}/bin/python" -m pip install --upgrade pip -q
+        "${VENV_DIR}/bin/python" -m pip install -r "${INSTALL_DIR}/requirements.txt" -q
         printf '%s\n' "${current_req_hash}" > "${REQ_HASH_FILE}"
     else
         ok "Python dependencies unchanged; reusing existing virtualenv."
@@ -428,6 +439,7 @@ hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/sysctl -w *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/vcgencmd *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/journalctl *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit hashwatcher-hub-update --collect --service-type=oneshot /opt/hashwatcher-hub-pi/ota_update_helper.sh *

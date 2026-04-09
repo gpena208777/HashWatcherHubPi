@@ -77,6 +77,51 @@ CANAAN_WORK_MODE_PROFILES: Dict[str, List[Dict[str, str]]] = {
     ],
 }
 
+DEVICE_LOG_STREAMS: Dict[str, Dict[str, Any]] = {
+    "hub": {"label": "Hub Service", "units": ["hashwatcher-hub-pi", "hashwatcher-hub"]},
+    "tailscale": {"label": "Tailscale", "units": ["tailscaled"]},
+    "wifi": {"label": "Wi-Fi / Network", "units": ["NetworkManager", "wpa_supplicant", "dhcpcd", "systemd-networkd"]},
+    "kernel": {"label": "Kernel", "kernel": True},
+}
+
+DEFAULT_PERSISTENT_LOG_PATH = "/opt/hashwatcher-hub-pi/logs/hub-agent.log"
+DEFAULT_PERSISTENT_LOG_MAX_BYTES = 512 * 1024
+DEFAULT_PERSISTENT_LOG_BACKUP_COUNT = 2
+DEFAULT_LOG_BUNDLE_MAX_BYTES = 1_500_000
+DEFAULT_LOG_BUNDLE_COMPACT_MAX_LINES = 180
+
+LOG_BUNDLE_SIGNAL_RE = re.compile(
+    r"\b(error|warn(?:ing)?|fail(?:ed|ure)?|panic|segfault|disconnect(?:ed)?|"
+    r"timeout|timed out|denied|refused|restart(?:ed|ing)?|stop(?:ped|ping)|"
+    r"crash(?:ed)?|fatal|unreachable|exception|not running)\b",
+    re.IGNORECASE,
+)
+
+LOG_BUNDLE_NOISE_PATTERNS: Dict[str, List[str]] = {
+    "all": [
+        "pam_unix(sudo:session): session opened for user root",
+        "pam_unix(sudo:session): session closed for user root",
+        "command=/usr/bin/vcgencmd",
+        "command=/usr/bin/journalctl",
+    ],
+    "tailscale": [
+        "magicsock:",
+        "derphttp.Client",
+        "dns: set",
+        "dns: resolvercfg",
+        "dns: oscfg",
+        "health(warnable=",
+        "peerapi:",
+        "rebind",
+    ],
+    "wifi": [
+        "device (wlan0): state change",
+        "dhcp4 (wlan0): state changed",
+        "supplicant interface state:",
+        "manager: startup complete",
+    ],
+}
+
 
 def env_str(name: str, default: str) -> str:
     value = os.getenv(name)
@@ -125,6 +170,21 @@ def parse_int(value: Any, default: int, minimum: Optional[int] = None, maximum: 
     return parsed
 
 
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def normalize_mac(value: Any) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -170,6 +230,18 @@ def is_newer_version(candidate: str, current: str) -> bool:
     cand_padded = cand_tuple + (0,) * (width - len(cand_tuple))
     curr_padded = curr_tuple + (0,) * (width - len(curr_tuple))
     return cand_padded > curr_padded
+
+
+def is_version_at_least(current: str, minimum: str) -> bool:
+    current_tuple = _version_tuple(current)
+    minimum_tuple = _version_tuple(minimum)
+    if current_tuple is None or minimum_tuple is None:
+        return current.strip() == minimum.strip()
+
+    width = max(len(current_tuple), len(minimum_tuple))
+    current_padded = current_tuple + (0,) * (width - len(current_tuple))
+    minimum_padded = minimum_tuple + (0,) * (width - len(minimum_tuple))
+    return current_padded >= minimum_padded
 
 
 class HubState:
@@ -249,7 +321,17 @@ class HubAgent:
 
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
-        self._max_log_entries = 200
+        self._max_log_entries = max(200, min(5000, env_int("INTERNAL_LOG_MAX_ENTRIES", 1500)))
+        self.persistent_log_path = env_str("PERSISTENT_LOG_PATH", DEFAULT_PERSISTENT_LOG_PATH)
+        self.persistent_log_max_bytes = max(128 * 1024, env_int("PERSISTENT_LOG_MAX_BYTES", DEFAULT_PERSISTENT_LOG_MAX_BYTES))
+        self.persistent_log_backup_count = max(1, min(5, env_int("PERSISTENT_LOG_BACKUP_COUNT", DEFAULT_PERSISTENT_LOG_BACKUP_COUNT)))
+        self.log_bundle_max_bytes = max(256 * 1024, env_int("LOG_BUNDLE_MAX_BYTES", DEFAULT_LOG_BUNDLE_MAX_BYTES))
+        self.log_bundle_compact_default = parse_bool(env_str("LOG_BUNDLE_COMPACT_DEFAULT", "1"), default=True)
+        self.log_bundle_compact_max_lines = max(
+            50,
+            min(800, env_int("LOG_BUNDLE_COMPACT_MAX_LINES", DEFAULT_LOG_BUNDLE_COMPACT_MAX_LINES)),
+        )
+        self._load_persistent_internal_logs()
 
     def _log(self, source: str, message: str, level: str = "error") -> None:
         entry: Dict[str, Any] = {
@@ -263,6 +345,358 @@ class HubAgent:
             self._error_log.append(entry)
             if len(self._error_log) > self._max_log_entries:
                 self._error_log = self._error_log[-self._max_log_entries:]
+        self._append_persistent_internal_log(entry)
+
+    def _persistent_log_files_oldest_first(self) -> List[str]:
+        files = [
+            f"{self.persistent_log_path}.{idx}"
+            for idx in range(self.persistent_log_backup_count, 0, -1)
+        ]
+        files.append(self.persistent_log_path)
+        return files
+
+    def _load_persistent_internal_logs(self) -> None:
+        entries: List[Dict[str, Any]] = []
+        for path in self._persistent_log_files_oldest_first():
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            parsed = json.loads(line)
+                        except Exception:
+                            continue
+                        if not isinstance(parsed, dict):
+                            continue
+                        if "message" not in parsed:
+                            continue
+                        entries.append({
+                            "ts": str(parsed.get("ts") or now_iso()),
+                            "level": str(parsed.get("level") or "info"),
+                            "source": str(parsed.get("source") or ""),
+                            "message": str(parsed.get("message") or ""),
+                        })
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"[{now_iso()}] WARNING: failed to read persistent logs from {path}: {exc}", flush=True)
+                continue
+
+        if not entries:
+            return
+        with self._log_lock:
+            self._error_log = entries[-self._max_log_entries:]
+
+    def _rotate_persistent_internal_logs(self) -> None:
+        base = self.persistent_log_path
+        try:
+            oldest = f"{base}.{self.persistent_log_backup_count}"
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for idx in range(self.persistent_log_backup_count - 1, 0, -1):
+                src = f"{base}.{idx}"
+                dst = f"{base}.{idx + 1}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            if os.path.exists(base):
+                os.replace(base, f"{base}.1")
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[{now_iso()}] WARNING: failed rotating persistent logs: {exc}", flush=True)
+
+    def _append_persistent_internal_log(self, entry: Dict[str, Any]) -> None:
+        try:
+            log_dir = os.path.dirname(self.persistent_log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            line = json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n"
+            line_bytes = len(line.encode("utf-8"))
+            current_size = 0
+            if os.path.exists(self.persistent_log_path):
+                current_size = os.path.getsize(self.persistent_log_path)
+            if current_size + line_bytes > self.persistent_log_max_bytes:
+                self._rotate_persistent_internal_logs()
+            with open(self.persistent_log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[{now_iso()}] WARNING: failed writing persistent log entry: {exc}", flush=True)
+
+    def get_internal_logs(self, limit: int = 100, level_filter: Optional[str] = None) -> Dict[str, Any]:
+        safe_limit = parse_int(limit, default=100, minimum=1, maximum=1000)
+        with self._log_lock:
+            entries = list(self._error_log)
+        if level_filter:
+            entries = [e for e in entries if e.get("level") == level_filter]
+        total = len(entries)
+        return {"entries": entries[-safe_limit:], "total": total}
+
+    def _bundle_line_has_signal(self, line: str) -> bool:
+        return LOG_BUNDLE_SIGNAL_RE.search(line or "") is not None
+
+    def _bundle_line_is_noise(self, stream: str, line: str) -> bool:
+        lower = (line or "").lower()
+        if stream == "tailscale" and "health(warnable=" in lower and ": ok" not in lower:
+            return False
+        patterns = LOG_BUNDLE_NOISE_PATTERNS.get("all", []) + LOG_BUNDLE_NOISE_PATTERNS.get(stream, [])
+        return any(pattern in lower for pattern in patterns)
+
+    def _normalize_for_dedupe(self, line: str) -> str:
+        normalized = re.sub(r"^\d{4}-\d{2}-\d{2}T\S+\s+\S+\s+", "", line or "")
+        normalized = re.sub(r"\[\d+\]", "[]", normalized)
+        return normalized.strip()
+
+    def _compact_bundle_stream_logs(self, stream: str, logs: str, max_lines: int) -> Dict[str, Any]:
+        raw_lines = [line for line in (logs or "").splitlines() if line.strip()]
+        kept: List[str] = []
+        removed_noise = 0
+        removed_repeat = 0
+        previous_norm = ""
+
+        for line in raw_lines:
+            if line.startswith("====="):
+                kept.append(line)
+                previous_norm = ""
+                continue
+
+            has_signal = self._bundle_line_has_signal(line)
+            if self._bundle_line_is_noise(stream, line) and not has_signal:
+                removed_noise += 1
+                continue
+
+            normalized = self._normalize_for_dedupe(line)
+            if normalized and normalized == previous_norm and not has_signal:
+                removed_repeat += 1
+                continue
+
+            previous_norm = normalized
+            kept.append(line)
+
+        removed_older = 0
+        if len(kept) > max_lines:
+            removed_older = len(kept) - max_lines
+            kept = kept[-max_lines:]
+
+        summary_parts: List[str] = []
+        if removed_noise:
+            summary_parts.append(f"noisy={removed_noise}")
+        if removed_repeat:
+            summary_parts.append(f"repeat={removed_repeat}")
+        if removed_older:
+            summary_parts.append(f"older={removed_older}")
+
+        return {
+            "logs": "\n".join(kept).strip(),
+            "summary": f"[compact] removed {'; '.join(summary_parts)}" if summary_parts else "",
+        }
+
+    def build_logs_bundle_text(self, per_stream_limit: int = 300, compact: Optional[bool] = None) -> str:
+        safe_limit = parse_int(per_stream_limit, default=300, minimum=50, maximum=1200)
+        compact_mode = self.log_bundle_compact_default if compact is None else bool(compact)
+        now = now_iso()
+
+        snapshot = self.state.snapshot()
+        ts_status = tailscale_setup.status()
+        wifi_status = self.get_wifi_status()
+        telemetry = self.get_pi_telemetry()
+        internal = self.get_internal_logs(limit=safe_limit)
+
+        lines: List[str] = []
+        lines.append("HashWatcher Hub Pi Diagnostic Logs Bundle")
+        lines.append(f"Generated: {now}")
+        lines.append(f"Hostname: {self.pi_hostname}")
+        lines.append(f"Agent ID: {self.agent_id}")
+        lines.append(f"Agent Version: {AGENT_VERSION}")
+        lines.append(f"Status API Version: {STATUS_API_VERSION}")
+        lines.append(f"Bundle Mode: {'compact' if compact_mode else 'full'}")
+        lines.append(
+            "Persistent Internal Log Storage: "
+            f"{self.persistent_log_path} (max {self.persistent_log_max_bytes} bytes, backups {self.persistent_log_backup_count})"
+        )
+        lines.append("")
+        lines.append("===== STATUS SNAPSHOT =====")
+        status_payload = {
+            "generatedAtIso": now,
+            "runtime": snapshot,
+            "wifi": wifi_status,
+            "tailscale": ts_status,
+            "piTelemetry": telemetry,
+        }
+        lines.append(json.dumps(status_payload, indent=2, sort_keys=True, default=str))
+        lines.append("")
+        lines.append("===== INTERNAL AGENT LOGS =====")
+        entries = internal.get("entries", [])
+        if entries:
+            for entry in entries:
+                lines.append(
+                    f"[{entry.get('ts', '')}] [{entry.get('level', 'info')}] "
+                    f"[{entry.get('source', '')}] {entry.get('message', '')}"
+                )
+        else:
+            lines.append("No internal agent log entries available.")
+
+        for stream in ("hub", "tailscale", "wifi", "kernel"):
+            lines.append("")
+            lines.append(f"===== {stream.upper()} JOURNAL =====")
+            result = self.get_device_logs(stream=stream, limit=safe_limit)
+            if not result.get("ok"):
+                lines.append(f"Failed to read {stream} logs: {result.get('error', 'unknown error')}")
+                continue
+            logs = str(result.get("logs") or "").strip()
+            if not logs:
+                lines.append("No logs returned.")
+                continue
+
+            if compact_mode:
+                compact_result = self._compact_bundle_stream_logs(
+                    stream=stream,
+                    logs=logs,
+                    max_lines=min(safe_limit, self.log_bundle_compact_max_lines),
+                )
+                compact_summary = str(compact_result.get("summary") or "").strip()
+                compact_logs = str(compact_result.get("logs") or "").strip()
+                if compact_summary:
+                    lines.append(compact_summary)
+                lines.append(compact_logs if compact_logs else "No compact log lines returned.")
+                continue
+
+            lines.append(logs)
+
+        bundle_text = "\n".join(lines).rstrip() + "\n"
+        raw = bundle_text.encode("utf-8", errors="replace")
+        if len(raw) <= self.log_bundle_max_bytes:
+            return bundle_text
+
+        marker = (
+            f"[trimmed] Bundle exceeded {self.log_bundle_max_bytes} bytes. "
+            "Showing most recent content only.\n"
+        ).encode("utf-8")
+        keep = raw[-max(0, self.log_bundle_max_bytes - len(marker)):]
+        newline_idx = keep.find(b"\n")
+        if newline_idx != -1:
+            keep = keep[newline_idx + 1:]
+        clipped = marker + keep
+        return clipped.decode("utf-8", errors="replace")
+
+    def _run_capture(self, command: List[str], timeout: int = 10) -> Dict[str, Any]:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            return {
+                "ok": result.returncode == 0,
+                "output": (result.stdout or "").strip(),
+                "error": (result.stderr or "").strip(),
+                "exitCode": result.returncode,
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"ok": False, "output": "", "error": str(exc), "exitCode": None}
+
+    def _journal_permission_issue(self, result: Dict[str, Any]) -> bool:
+        text = f"{result.get('output', '')}\n{result.get('error', '')}".lower()
+        patterns = (
+            "insufficient permissions",
+            "not seeing messages from other users and the system",
+            "users in groups 'adm', 'systemd-journal'",
+            "no journal files were opened due to insufficient permissions",
+            "permission denied",
+        )
+        return any(pattern in text for pattern in patterns)
+
+    def _read_journal(self, args: List[str], timeout: int = 10) -> Dict[str, Any]:
+        direct = self._run_capture(["journalctl", *args], timeout=timeout)
+        if direct.get("ok") and not self._journal_permission_issue(direct):
+            return direct
+
+        needs_sudo = self._journal_permission_issue(direct)
+        if not needs_sudo:
+            return direct
+
+        elevated = self._run_capture(["sudo", "-n", "journalctl", *args], timeout=timeout)
+        if elevated.get("ok"):
+            return elevated
+        return elevated
+
+    def get_device_logs(self, stream: str = "hub", limit: int = 200) -> Dict[str, Any]:
+        stream_key = (stream or "hub").strip().lower()
+        if stream_key == "all":
+            per_stream_limit = max(20, min(400, limit) // 4)
+            sections: List[str] = []
+            errors: List[str] = []
+            for part_stream in ("hub", "tailscale", "wifi", "kernel"):
+                result = self.get_device_logs(part_stream, per_stream_limit)
+                if result.get("ok"):
+                    payload = str(result.get("logs") or "").strip()
+                    if payload:
+                        sections.append(f"===== {result.get('streamLabel', part_stream)} =====\n{payload}")
+                else:
+                    errors.append(f"{part_stream}: {result.get('error', 'unknown error')}")
+            combined = "\n\n".join(sections).strip()
+            if not combined and errors:
+                return {"ok": False, "stream": "all", "streamLabel": "All Streams", "error": "; ".join(errors)}
+            return {
+                "ok": True,
+                "stream": "all",
+                "streamLabel": "All Streams",
+                "limitRequested": limit,
+                "linesReturned": len(combined.splitlines()) if combined else 0,
+                "generatedAtIso": now_iso(),
+                "logs": combined or "No logs available.",
+                "errors": errors,
+            }
+
+        stream_meta = DEVICE_LOG_STREAMS.get(stream_key)
+        if stream_meta is None:
+            return {"ok": False, "error": f"Invalid stream '{stream_key}'. Use hub, tailscale, wifi, kernel, or all."}
+
+        safe_limit = parse_int(limit, default=200, minimum=20, maximum=1000)
+        base_args = ["-q", "--no-pager", "--output=short-iso", "-n", str(safe_limit)]
+
+        if stream_meta.get("kernel"):
+            result = self._read_journal([*base_args, "-k"])
+            if not result.get("ok"):
+                return {"ok": False, "stream": stream_key, "streamLabel": stream_meta["label"], "error": result.get("error") or "journalctl failed"}
+            logs = str(result.get("output") or "").strip()
+            return {
+                "ok": True,
+                "stream": stream_key,
+                "streamLabel": stream_meta["label"],
+                "limitRequested": safe_limit,
+                "linesReturned": len(logs.splitlines()) if logs else 0,
+                "generatedAtIso": now_iso(),
+                "logs": logs or "No kernel log lines returned.",
+            }
+
+        units = [str(unit) for unit in stream_meta.get("units", []) if str(unit).strip()]
+        sections: List[str] = []
+        errors: List[str] = []
+        for unit in units:
+            result = self._read_journal([*base_args, "-u", unit])
+            if result.get("ok"):
+                output = str(result.get("output") or "").strip()
+                if output:
+                    sections.append(f"===== {unit} =====\n{output}")
+                continue
+            err = str(result.get("error") or "journalctl failed").strip()
+            errors.append(f"{unit}: {err}")
+
+        combined = "\n\n".join(sections).strip()
+        if not combined and errors:
+            return {
+                "ok": False,
+                "stream": stream_key,
+                "streamLabel": stream_meta["label"],
+                "error": "; ".join(errors),
+            }
+
+        return {
+            "ok": True,
+            "stream": stream_key,
+            "streamLabel": stream_meta["label"],
+            "limitRequested": safe_limit,
+            "linesReturned": len(combined.splitlines()) if combined else 0,
+            "generatedAtIso": now_iso(),
+            "logs": combined or "No log lines returned for this stream.",
+            "errors": errors,
+        }
 
     def _load_runtime_config(self) -> None:
         if not os.path.exists(self.runtime_config_path):
@@ -461,6 +895,19 @@ class HubAgent:
             and ts.get("online", False)
             and ts.get("routesApproved", False)
             and not ts.get("keyExpired", False)
+        )
+
+    def is_paired_status(
+        self,
+        wifi_status: Optional[Dict[str, Any]] = None,
+        ts_status: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        wifi = wifi_status if wifi_status is not None else self.get_wifi_status()
+        ts = ts_status if ts_status is not None else tailscale_setup.status()
+        return bool(
+            wifi.get("connected", False)
+            and ts.get("authenticated", False)
+            and ts.get("routesApproved", False)
         )
 
     def get_runtime_config(self) -> Dict[str, Any]:
@@ -2075,6 +2522,20 @@ netplan apply 2>/dev/null || true
                     # Client closed the connection before we finished (e.g. app timeout, navigation). Normal; no traceback.
                     pass
 
+            def _send_text(self, body: str, status: int = 200, filename: Optional[str] = None) -> None:
+                data = body.encode("utf-8", errors="replace")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                if filename:
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+
             def _send_html(self, body: str, status: int = 200) -> None:
                 data = body.encode("utf-8")
                 self.send_response(status)
@@ -2105,6 +2566,7 @@ netplan apply 2>/dev/null || true
                 local_clock = agent.local_clock_status()
                 fleet_manager = agent.get_fleet_manager_status()
 
+                paired_status = agent.is_paired_status(wifi_status, ts_status)
                 setup_complete = agent.is_setup_complete(wifi_status, ts_status)
 
                 status = {
@@ -2115,7 +2577,7 @@ netplan apply 2>/dev/null || true
                     "hubVersion": AGENT_VERSION,
                     "statusApiVersion": STATUS_API_VERSION,
                     "bitaxeHost": agent.bitaxe_host,
-                    "isPaired": setup_complete,
+                    "isPaired": paired_status,
                     "setupComplete": setup_complete,
                     "pollSeconds": agent.poll_seconds,
                     "statusHttpPort": agent.status_http_port,
@@ -2163,15 +2625,37 @@ netplan apply 2>/dev/null || true
                     query = parse_qs(parsed.query)
                     limit = parse_int((query.get("limit") or ["100"])[0], default=100, minimum=1, maximum=1000)
                     level_filter = (query.get("level") or [None])[0]
-                    with agent._log_lock:
-                        entries = list(agent._error_log)
-                    if level_filter:
-                        entries = [e for e in entries if e.get("level") == level_filter]
+                    logs_result = agent.get_internal_logs(limit=limit, level_filter=level_filter)
                     self._send_json({
                         "ok": True,
-                        "count": len(entries),
-                        "entries": entries[-limit:],
+                        "count": logs_result.get("total", 0),
+                        "entries": logs_result.get("entries", []),
+                        "persistentHistory": True,
+                        "storage": {
+                            "path": agent.persistent_log_path,
+                            "maxBytes": agent.persistent_log_max_bytes,
+                            "backupCount": agent.persistent_log_backup_count,
+                        },
                     })
+                    return
+
+                if parsed.path == "/api/device/logs/bundle.txt":
+                    query = parse_qs(parsed.query)
+                    limit = parse_int((query.get("limit") or ["300"])[0], default=300, minimum=50, maximum=1200)
+                    compact_raw = (query.get("compact") or [None])[0]
+                    compact = parse_bool(compact_raw, default=agent.log_bundle_compact_default)
+                    bundle = agent.build_logs_bundle_text(per_stream_limit=limit, compact=compact)
+                    filename = f"hashwatcher-hub-logs-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%SZ')}.txt"
+                    self._send_text(bundle, status=200, filename=filename)
+                    return
+
+                if parsed.path == "/api/device/logs":
+                    query = parse_qs(parsed.query)
+                    stream = str((query.get("stream") or ["hub"])[0]).strip().lower()
+                    limit = parse_int((query.get("limit") or ["200"])[0], default=200, minimum=20, maximum=1000)
+                    result = agent.get_device_logs(stream=stream, limit=limit)
+                    http_status = 200 if result.get("ok") else 503
+                    self._send_json(result, status=http_status)
                     return
 
                 if parsed.path == "/api/tailscale/status":
@@ -2238,6 +2722,7 @@ netplan apply 2>/dev/null || true
                     wifi_signal = wifi_status.get("signalDbm")
                     ts_online = ts_status.get("online", False)
                     ts_authenticated = ts_status.get("authenticated", False)
+                    logs_bundle_supported = is_version_at_least(AGENT_VERSION, "1.0.9")
                     setup_done = wifi_ok and ts_authenticated
                     led_supported = led_status.get("supported", False)
                     led_name = led_status.get("name") or "ACT"
@@ -2351,7 +2836,15 @@ netplan apply 2>/dev/null || true
     .btn-warn:hover {{ background: rgba(239,68,68,0.25); }}
     .btn-secondary {{ background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.8); border: 1px solid rgba(255,255,255,0.12); padding: 8px 14px; border-radius: 10px; font-weight: 600; font-size: 0.85em; cursor: pointer; }}
     .btn-secondary:hover {{ background: rgba(255,255,255,0.12); }}
+    .input {{ background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15); color: #fff; border-radius: 8px; padding: 6px 10px; font-size: 0.85em; }}
+    .input:focus {{ outline: 1px solid rgba(51,230,128,0.55); border-color: rgba(51,230,128,0.55); }}
     pre {{ white-space: pre-wrap; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 10px; font-size: 0.85em; color: rgba(255,255,255,0.7); }}
+    .log-pre-compact {{ max-height: 240px; overflow: auto; }}
+    details.collapsible {{ margin-top: 10px; }}
+    details.collapsible > summary {{ cursor: pointer; color: rgba(255,255,255,0.8); font-size: 0.85em; font-weight: 600; list-style: none; }}
+    details.collapsible > summary::-webkit-details-marker {{ display: none; }}
+    details.collapsible > summary::before {{ content: '>'; display: inline-block; margin-right: 8px; color: rgba(51,230,128,0.8); }}
+    details.collapsible[open] > summary::before {{ content: 'v'; }}
     .brand-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 16px; font-size: 1.3em; font-weight: 700; }}
     .setup-card {{ background: rgba(0,204,102,0.08); border: 1px solid rgba(0,204,102,0.25); border-radius: 14px; padding: 20px; margin-bottom: 16px; text-align: center; }}
     .setup-card h3 {{ margin: 0 0 8px; color: #33e680; }}
@@ -2430,18 +2923,52 @@ netplan apply 2>/dev/null || true
         <button class="btn-secondary" onclick="runLedAction('blink')" {'disabled' if not led_supported else ''}>Blink</button>
         <button class="btn-secondary" onclick="runLedAction('restore-default')" {'disabled' if not led_supported else ''}>Restore Default</button>
       </div>
-      <pre id="ledActionStatus">{led_action_status}</pre>
+      <details class="collapsible" id="ledActionDetails">
+        <summary>Show LED action logs</summary>
+        <pre id="ledActionStatus" class="log-pre-compact">{led_action_status}</pre>
+      </details>
     </div>
 
-	    <div class="card">
-	      <h3 style="margin:0 0 12px;">Maintenance</h3>
-	      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-	        <button class="btn-secondary" onclick="runSelfCheck()">Run Self-Check</button>
-	        <button class="btn-warn" onclick="hardResetWifi()">Disconnect + Reset Wi-Fi</button>
-	        <button class="btn-warn" onclick="factoryReset()">Factory Reset</button>
-	      </div>
-      <pre id="actionStatus">No actions run yet.</pre>
-      <p class="muted" style="font-size:0.8em;margin:10px 0 0;">API: <a href="/api/status">/api/status</a> &middot; <a href="/api/wifi/status">/api/wifi/status</a> &middot; <a href="/api/led/status">/api/led/status</a> &middot; <a href="/api/self-check">/api/self-check</a></p>
+    <div class="card">
+      <h3 style="margin:0 0 12px;">Maintenance</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn-secondary" onclick="runSelfCheck()">Run Self-Check</button>
+        <button class="btn-warn" onclick="hardResetWifi()">Disconnect + Reset Wi-Fi</button>
+        <button class="btn-warn" onclick="factoryReset()">Factory Reset</button>
+      </div>
+      <details class="collapsible" id="maintenanceActionDetails">
+        <summary>Show maintenance action logs</summary>
+        <pre id="actionStatus" class="log-pre-compact">No actions run yet.</pre>
+      </details>
+      <p class="muted" style="font-size:0.8em;margin:10px 0 0;">API: <a href="/api/status">/api/status</a> &middot; <a href="/api/wifi/status">/api/wifi/status</a> &middot; <a href="/api/led/status">/api/led/status</a> &middot; <a href="/api/self-check">/api/self-check</a> &middot; <a href="/api/device/logs?stream=hub&limit=200">/api/device/logs</a></p>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px;">Device Logs</h3>
+      <p class="muted" style="margin:0 0 10px;font-size:0.85em;">Use local journal logs to troubleshoot Wi-Fi or Tailscale disconnects.</p>
+      <details class="collapsible" id="deviceLogsDetails">
+        <summary>Show device logs</summary>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0;">
+          <label for="logStream" class="muted" style="font-size:0.85em;">Stream</label>
+          <select id="logStream" class="input">
+            <option value="hub">Hub Service</option>
+            <option value="tailscale">Tailscale</option>
+            <option value="wifi">Wi-Fi / Network</option>
+            <option value="kernel">Kernel</option>
+            <option value="all">All Streams</option>
+          </select>
+          <label for="logLimit" class="muted" style="font-size:0.85em;">Lines</label>
+          <input id="logLimit" class="input" type="number" min="20" max="1000" value="200" style="width:90px;" />
+          <button class="btn-secondary" id="refreshLogsBtn" onclick="loadDeviceLogs()">Refresh</button>
+          <label class="muted" style="font-size:0.82em;display:inline-flex;align-items:center;gap:6px;">
+            <input id="autoRefreshLogs" type="checkbox" checked />
+            Auto-refresh
+          </label>
+          {'<a class="btn-secondary" id="downloadLogsBundleBtn" href="/api/device/logs/bundle.txt?limit=300&compact=1" target="_blank" rel="noopener">Download Bundle (.txt)</a>' if logs_bundle_supported else ''}
+        </div>
+        <p class="muted" id="deviceLogsMeta" style="margin:0 0 8px;font-size:0.78em;">Expand this panel and click refresh to load logs.</p>
+        <pre id="deviceLogsOutput" class="log-pre-compact">Logs are collapsed. Expand this panel to load logs.</pre>
+      </details>
     </div>
 
     <div class="card">
@@ -2458,6 +2985,7 @@ netplan apply 2>/dev/null || true
 
   <script>
     let tsOn = {'true' if ts_online else 'false'};
+    let deviceLogsLoading = false;
     async function toggleTailscale() {{
       const btn = document.getElementById('tsToggleBtn');
       const st = document.getElementById('tsToggleStatus');
@@ -2532,6 +3060,65 @@ netplan apply 2>/dev/null || true
         el.textContent = 'Factory reset sent. Connection lost (expected).\\nReconnect via the HashWatcher app.';
       }}
     }}
+    async function loadDeviceLogs() {{
+      if (deviceLogsLoading) return;
+      const detailsEl = document.getElementById('deviceLogsDetails');
+      if (detailsEl && !detailsEl.open) return;
+      const outputEl = document.getElementById('deviceLogsOutput');
+      const metaEl = document.getElementById('deviceLogsMeta');
+      const streamEl = document.getElementById('logStream');
+      const limitEl = document.getElementById('logLimit');
+      const btn = document.getElementById('refreshLogsBtn');
+      const bundleBtn = document.getElementById('downloadLogsBundleBtn');
+      if (!outputEl || !metaEl || !streamEl || !limitEl || !btn) return;
+
+      let limit = parseInt(limitEl.value || '200', 10);
+      if (Number.isNaN(limit)) limit = 200;
+      limit = Math.max(20, Math.min(1000, limit));
+      limitEl.value = String(limit);
+      const stream = streamEl.value || 'hub';
+      if (bundleBtn) {{
+        bundleBtn.href = '/api/device/logs/bundle.txt?limit=' + encodeURIComponent(String(limit)) + '&compact=1';
+      }}
+
+      deviceLogsLoading = true;
+      btn.disabled = true;
+      metaEl.textContent = 'Loading logs...';
+      try {{
+        const r = await fetch('/api/device/logs?stream=' + encodeURIComponent(stream) + '&limit=' + encodeURIComponent(String(limit)));
+        const p = await r.json();
+        if (p.ok) {{
+          outputEl.textContent = p.logs || 'No logs returned.';
+          let meta = (p.streamLabel || stream) + ' \u00b7 ' + (p.linesReturned || 0) + ' lines';
+          if (p.generatedAtIso) meta += ' \u00b7 ' + p.generatedAtIso;
+          if (p.errors && p.errors.length) meta += ' \u00b7 warnings: ' + p.errors.length;
+          metaEl.textContent = meta;
+        }} else {{
+          outputEl.textContent = 'Failed to load logs.';
+          metaEl.textContent = 'Error: ' + (p.error || 'unknown');
+        }}
+      }} catch (e) {{
+        outputEl.textContent = 'Failed to load logs.';
+        metaEl.textContent = 'Request failed.';
+      }}
+      btn.disabled = false;
+      deviceLogsLoading = false;
+    }}
+    const deviceLogsDetailsEl = document.getElementById('deviceLogsDetails');
+    if (deviceLogsDetailsEl) {{
+      deviceLogsDetailsEl.addEventListener('toggle', () => {{
+        if (deviceLogsDetailsEl.open) loadDeviceLogs();
+      }});
+    }}
+    const logStreamEl = document.getElementById('logStream');
+    if (logStreamEl) logStreamEl.addEventListener('change', loadDeviceLogs);
+    const logLimitEl = document.getElementById('logLimit');
+    if (logLimitEl) logLimitEl.addEventListener('change', loadDeviceLogs);
+    setInterval(() => {{
+      const autoEl = document.getElementById('autoRefreshLogs');
+      const detailsEl = document.getElementById('deviceLogsDetails');
+      if (detailsEl && detailsEl.open && autoEl && autoEl.checked) loadDeviceLogs();
+    }}, 10000);
     async function checkForUpdate() {{
       const btn = document.getElementById('checkUpdateBtn');
       const applyBtn = document.getElementById('applyUpdateBtn');
