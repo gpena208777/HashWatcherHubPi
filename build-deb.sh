@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${1:-1.0.1}"
+VERSION="${1:-1.0.10}"
 PKG_NAME="hashwatcher-hub-pi"
 PKG_DIR="${SCRIPT_DIR}/_build/${PKG_NAME}_${VERSION}_all"
 
@@ -51,9 +51,11 @@ SYSTEMD_DIR="${PKG_DIR}/etc/systemd/system"
 mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${SYSTEMD_DIR}"
 
 PYTHON_FILES=(
+    VERSION
     hashwatcher_hub_agent.py
     hub_ble_provisioner.py
     tailscale_setup.py
+    ota_update_helper.sh
     requirements.txt
     icon.png
 )
@@ -66,7 +68,7 @@ for f in "${PYTHON_FILES[@]}"; do
     fi
 done
 
-# Stamp the version so the update agent knows what's installed
+# Stamp the package version so the update agent knows what's installed.
 echo "${VERSION}" > "${INSTALL_DIR}/VERSION"
 
 # ── Default config (won't overwrite existing on upgrade) ─────────────
@@ -134,6 +136,18 @@ if command -v dpkg-deb &>/dev/null; then
         echo "  docker run --rm -v \"${SCRIPT_DIR}:/work\" -w /work debian:bookworm-slim dpkg-deb --build /work/_build/${PKG_NAME}_${VERSION}_all /work/${PKG_NAME}_${VERSION}_all.deb"
         exit 1
     }
+elif command -v bsdtar &>/dev/null && command -v ar &>/dev/null; then
+    echo "Building .deb with local ar/bsdtar..."
+    rm -f "${DEB_OUT}"
+    printf '2.0\n' > "${SCRIPT_DIR}/_build/debian-binary"
+    COPYFILE_DISABLE=1 bsdtar --uid 0 --gid 0 --uname root --gname root \
+        -C "${PKG_DIR}/DEBIAN" -cJf "${SCRIPT_DIR}/_build/control.tar.xz" .
+    COPYFILE_DISABLE=1 bsdtar --uid 0 --gid 0 --uname root --gname root \
+        --exclude './DEBIAN' -C "${PKG_DIR}" -cJf "${SCRIPT_DIR}/_build/data.tar.xz" .
+    (
+        cd "${SCRIPT_DIR}/_build"
+        ar -q "${DEB_OUT}" debian-binary control.tar.xz data.tar.xz
+    )
 else
     echo "Building .deb via Docker..."
     docker run --rm -v "${SCRIPT_DIR}:/work" -w /work debian:bookworm-slim \

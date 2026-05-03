@@ -7,6 +7,21 @@ SERVICE_USER="hashwatcher-hub-pi"
 VENV_DIR="${INSTALL_DIR}/.venv"
 REQ_HASH_FILE="${INSTALL_DIR}/.requirements.sha256"
 
+venv_uses_system_site_packages() {
+    [[ -f "${VENV_DIR}/pyvenv.cfg" ]] && grep -qi '^include-system-site-packages *= *true' "${VENV_DIR}/pyvenv.cfg"
+}
+
+venv_has_requirements() {
+    "${VENV_DIR}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+required = ("requests", "dotenv", "bluezero", "dbus", "gi")
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+sys.exit(0 if not missing else 1)
+PY
+}
+
 is_rootfs_read_only() {
     local mount_opts
     mount_opts="$(findmnt -no OPTIONS / 2>/dev/null || true)"
@@ -25,25 +40,29 @@ if ! id "${SERVICE_USER}" &>/dev/null; then
     useradd -r -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
 fi
 
-if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    python3 -m venv "${VENV_DIR}"
+# DBus/GI bindings are Debian packages. Expose system site packages instead
+# of compiling native Python bindings from pip on low-memory Pi hardware.
+if [[ ! -x "${VENV_DIR}/bin/python" ]] || ! venv_uses_system_site_packages; then
+    rm -rf "${VENV_DIR}"
+    python3 -m venv --system-site-packages "${VENV_DIR}"
 fi
 
 CURRENT_REQ_HASH="$(sha256sum "${INSTALL_DIR}/requirements.txt" | awk '{print $1}')"
 SAVED_REQ_HASH="$(cat "${REQ_HASH_FILE}" 2>/dev/null || true)"
 
-if [[ "${CURRENT_REQ_HASH}" != "${SAVED_REQ_HASH}" ]]; then
-    if ! "${VENV_DIR}/bin/pip" install --upgrade pip -q; then
+if [[ "${CURRENT_REQ_HASH}" != "${SAVED_REQ_HASH}" ]] || ! venv_has_requirements; then
+    echo "[HashWatcher] Installing Python dependencies. First install can take a few minutes on Pi Zero-class hardware."
+    if ! "${VENV_DIR}/bin/python" -m pip install --upgrade pip; then
         echo "[HashWatcher] ERROR: pip bootstrap failed in ${VENV_DIR}."
         exit 1
     fi
-    if ! "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" -q; then
+    if ! "${VENV_DIR}/bin/python" -m pip install --prefer-binary -r "${INSTALL_DIR}/requirements.txt"; then
         echo "[HashWatcher] ERROR: Python dependency install failed."
-        echo "[HashWatcher] Re-running pip in verbose mode for diagnostics..."
-        "${VENV_DIR}/bin/pip" install -r "${INSTALL_DIR}/requirements.txt"
         exit 1
     fi
     printf '%s\n' "${CURRENT_REQ_HASH}" > "${REQ_HASH_FILE}"
+else
+    echo "[HashWatcher] Python dependencies already installed."
 fi
 
 # Ensure tailscaled is enabled when Tailscale is already installed.
@@ -70,8 +89,11 @@ hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/reboot
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/sysctl -w *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/vcgencmd *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/journalctl *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit hashwatcher-hub-update --collect --service-type=oneshot /opt/hashwatcher-hub-pi/ota_update_helper.sh *
 SUDOERS
 chmod 0440 /etc/sudoers.d/hashwatcher-hub-pi
 

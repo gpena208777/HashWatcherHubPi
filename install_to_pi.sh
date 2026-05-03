@@ -25,10 +25,12 @@ trap cleanup EXIT
 
 echo "Bundling files"
 tar -C "${ROOT_DIR}" -czf "${TMP_ARCHIVE}" \
+  VERSION \
   install.sh \
   hashwatcher_hub_agent.py \
   hub_ble_provisioner.py \
   tailscale_setup.py \
+  ota_update_helper.sh \
   requirements.txt \
   hashwatcher-hub.service \
   hashwatcher-ble-provisioner.service \

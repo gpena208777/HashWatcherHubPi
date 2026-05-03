@@ -14,10 +14,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${SCRIPT_DIR}/hashwatcher-hub-pi.tar.gz"
 
 FILES=(
+    VERSION
     install.sh
     hashwatcher_hub_agent.py
     hub_ble_provisioner.py
     tailscale_setup.py
+    ota_update_helper.sh
     requirements.txt
     hashwatcher-hub.service
     hashwatcher-ble-provisioner.service
@@ -37,7 +39,7 @@ echo ""
 echo "Upload this file as a GitHub Release asset:"
 echo ""
 echo "Or build and upload the .deb too:"
-echo "  ./build-deb.sh 1.0.1"
+echo "  ./build-deb.sh 1.0.10"
 echo ""
 echo "Upload both to the public repo:"
-echo "  gh release create v1.0.1 ${OUT} hashwatcher-hub-pi_1.0.1_all.deb --repo gpena208777/HashWatcherHubPi --title 'v1.0.1' --notes 'HashWatcher Hub Pi v1.0.1'"
+echo "  gh release create v1.0.10 ${OUT} hashwatcher-hub-pi_1.0.10_all.deb --repo gpena208777/HashWatcherHubPi --title 'v1.0.10' --notes 'HashWatcher Hub Pi v1.0.10'"

@@ -43,6 +43,7 @@ cp "${SCRIPT_DIR}/firstrun.sh"                  "${TARGET_DIR}/"
 cp "${SCRIPT_DIR}/hashwatcher_hub_agent.py"  "${TARGET_DIR}/"
 cp "${SCRIPT_DIR}/hub_ble_provisioner.py"       "${TARGET_DIR}/"
 cp "${SCRIPT_DIR}/tailscale_setup.py"           "${TARGET_DIR}/"
+cp "${SCRIPT_DIR}/ota_update_helper.sh"         "${TARGET_DIR}/"
 cp "${SCRIPT_DIR}/requirements.txt"             "${TARGET_DIR}/"
 cp "${SCRIPT_DIR}/icon.png"                    "${TARGET_DIR}/"
 cp "${SCRIPT_DIR}/hub.env.prepared"             "${TARGET_DIR}/"
@@ -55,6 +56,8 @@ cp "${SCRIPT_DIR}/README-hashwatcherpi.md"      "${TARGET_DIR}/README.md"
 
 if [[ -n "${VERSION}" ]]; then
     echo "${VERSION}" > "${TARGET_DIR}/VERSION"
+else
+    cp "${SCRIPT_DIR}/VERSION" "${TARGET_DIR}/" 2>/dev/null || true
 fi
 
 echo ""

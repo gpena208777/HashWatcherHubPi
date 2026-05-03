@@ -216,6 +216,9 @@ required_packages=(
     python3-pip
     python3-dev
     python3-dbus
+    python3-gi
+    python3-cairo
+    gir1.2-glib-2.0
     bluetooth
     bluez
     libbluetooth-dev
@@ -324,10 +327,14 @@ venv_has_requirements() {
 import importlib.util
 import sys
 
-required = ("requests", "dotenv", "bluezero", "dbus")
+required = ("requests", "dotenv", "bluezero", "dbus", "gi")
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 sys.exit(0 if not missing else 1)
 PY
+}
+
+venv_uses_system_site_packages() {
+    [[ -f "${VENV_DIR}/pyvenv.cfg" ]] && grep -qi '^include-system-site-packages *= *true' "${VENV_DIR}/pyvenv.cfg"
 }
 
 install_from_source() {
@@ -416,16 +423,21 @@ EOF
     current_req_hash="$(sha256sum "${INSTALL_DIR}/requirements.txt" | awk '{print $1}')"
     saved_req_hash="$(cat "${REQ_HASH_FILE}" 2>/dev/null || true)"
 
+    if [[ -x "${VENV_DIR}/bin/python" ]] && ! venv_uses_system_site_packages; then
+        info "Recreating Python virtual environment with system DBus/GI bindings..."
+        rm -rf "${VENV_DIR}"
+    fi
+
     if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
         info "Creating Python virtual environment..."
-        python3 -m venv "${VENV_DIR}"
+        python3 -m venv --system-site-packages "${VENV_DIR}"
         venv_created=1
     fi
 
     if [[ "${current_req_hash}" != "${saved_req_hash}" || "${venv_created}" -eq 1 ]] || ! venv_has_requirements; then
-        info "Installing Python dependencies..."
-        "${VENV_DIR}/bin/python" -m pip install --upgrade pip -q
-        "${VENV_DIR}/bin/python" -m pip install -r "${INSTALL_DIR}/requirements.txt" -q
+        info "Installing Python dependencies. First install can take a few minutes on Pi Zero-class hardware..."
+        "${VENV_DIR}/bin/python" -m pip install --upgrade pip
+        "${VENV_DIR}/bin/python" -m pip install --prefer-binary -r "${INSTALL_DIR}/requirements.txt"
         printf '%s\n' "${current_req_hash}" > "${REQ_HASH_FILE}"
     else
         ok "Python dependencies unchanged; reusing existing virtualenv."
