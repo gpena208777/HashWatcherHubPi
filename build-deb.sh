@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${1:-1.0.10}"
+VERSION="${1:-1.0.11}"
 PKG_NAME="hashwatcher-hub-pi"
 PKG_DIR="${SCRIPT_DIR}/_build/${PKG_NAME}_${VERSION}_all"
 
@@ -136,18 +136,43 @@ if command -v dpkg-deb &>/dev/null; then
         echo "  docker run --rm -v \"${SCRIPT_DIR}:/work\" -w /work debian:bookworm-slim dpkg-deb --build /work/_build/${PKG_NAME}_${VERSION}_all /work/${PKG_NAME}_${VERSION}_all.deb"
         exit 1
     }
-elif command -v bsdtar &>/dev/null && command -v ar &>/dev/null; then
-    echo "Building .deb with local ar/bsdtar..."
+elif command -v bsdtar &>/dev/null && command -v python3 &>/dev/null; then
+    echo "Building .deb with local bsdtar/python..."
     rm -f "${DEB_OUT}"
     printf '2.0\n' > "${SCRIPT_DIR}/_build/debian-binary"
-    COPYFILE_DISABLE=1 bsdtar --uid 0 --gid 0 --uname root --gname root \
+    COPYFILE_DISABLE=1 bsdtar --format ustar --uid 0 --gid 0 --uname root --gname root \
         -C "${PKG_DIR}/DEBIAN" -cJf "${SCRIPT_DIR}/_build/control.tar.xz" .
-    COPYFILE_DISABLE=1 bsdtar --uid 0 --gid 0 --uname root --gname root \
+    COPYFILE_DISABLE=1 bsdtar --format ustar --uid 0 --gid 0 --uname root --gname root \
         --exclude './DEBIAN' -C "${PKG_DIR}" -cJf "${SCRIPT_DIR}/_build/data.tar.xz" .
-    (
-        cd "${SCRIPT_DIR}/_build"
-        ar -q "${DEB_OUT}" debian-binary control.tar.xz data.tar.xz
-    )
+    python3 - "${DEB_OUT}" \
+        "${SCRIPT_DIR}/_build/debian-binary" \
+        "${SCRIPT_DIR}/_build/control.tar.xz" \
+        "${SCRIPT_DIR}/_build/data.tar.xz" <<'PY'
+import os
+import sys
+
+out_path = sys.argv[1]
+members = sys.argv[2:]
+
+with open(out_path, "wb") as out:
+    out.write(b"!<arch>\n")
+    for path in members:
+        name = os.path.basename(path)
+        data = open(path, "rb").read()
+        header = (
+            f"{name:<16}"
+            f"{0:<12}"
+            f"{0:<6}"
+            f"{0:<6}"
+            f"{'100644':<8}"
+            f"{len(data):<10}"
+            "`\n"
+        )
+        out.write(header.encode("ascii"))
+        out.write(data)
+        if len(data) % 2:
+            out.write(b"\n")
+PY
 else
     echo "Building .deb via Docker..."
     docker run --rm -v "${SCRIPT_DIR}:/work" -w /work debian:bookworm-slim \

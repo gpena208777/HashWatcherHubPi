@@ -21,6 +21,8 @@ IP_ONLY_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000006"
 
 # Keep one fixed BLE name so a single generic image works for all shipped hubs.
 DEVICE_NAME = "HashWatcherHub"
+DEVICE_NAME_ADV_HEX = "0F094861736857617463686572487562"
+BLE_ADV_INSTANCE_ID = "1"
 
 # Pair status codes sent over BLE for iOS HubOnboardingView to display
 PAIR_STATUS_CREDS_RECEIVED = "creds-received"
@@ -226,12 +228,70 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def safe_shell(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+def safe_shell(cmd: list[str], timeout_seconds: int = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr or "command timed out")
 
 
 def has_cmd(name: str) -> bool:
     return safe_shell(["bash", "-lc", f"command -v {name} >/dev/null 2>&1"]).returncode == 0
+
+
+def start_ble_advertisement() -> None:
+    """Advertise with btmgmt; Bluezero's D-Bus advert is rejected on Pi BlueZ 5.82."""
+    if not has_cmd("btmgmt"):
+        print(f"[{now_iso()}] btmgmt not found; BLE advertisement may not be visible", flush=True)
+        return
+
+    try:
+        proc = subprocess.Popen([
+            "btmgmt",
+            "add-adv",
+            "-g",
+            "-c",
+            "-d",
+            DEVICE_NAME_ADV_HEX,
+            BLE_ADV_INSTANCE_ID,
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        if proc.poll() is None:
+            print(f"[{now_iso()}] BLE advertising as {DEVICE_NAME}", flush=True)
+            return
+        if proc.returncode == 0:
+            print(f"[{now_iso()}] BLE advertising as {DEVICE_NAME}", flush=True)
+            return
+        print(f"[{now_iso()}] BLE advertising failed: btmgmt exited {proc.returncode}", flush=True)
+    except Exception as exc:
+        print(f"[{now_iso()}] BLE advertising failed: {exc}", flush=True)
+        return
+
+
+def publish_gatt_only(ble: peripheral.Peripheral) -> None:
+    """Register GATT without Bluezero's advertisement registration."""
+    for service in ble.services:
+        ble.app.add_managed_object(service)
+    for chars in ble.characteristics:
+        ble.app.add_managed_object(chars)
+    for desc in ble.descriptors:
+        ble.app.add_managed_object(desc)
+    if not ble.dongle.powered:
+        ble.dongle.powered = True
+    ble.srv_mng.register_application(ble.app, {})
+    try:
+        ble.mainloop.run()
+    except KeyboardInterrupt:
+        ble.mainloop.quit()
 
 
 def _short_err(result: subprocess.CompletedProcess, limit: int = 160) -> str:
@@ -589,8 +649,6 @@ def main() -> None:
         read_callback=ip_only_read_callback,
     )
     _ble_peripheral = ble
-    ble.publish()
-    emit_detail_status("ble-ready")
 
     def _reconnect_saved_wifi() -> None:
         """On boot, re-apply last known credentials so power cycles keep Wi-Fi working."""
@@ -652,8 +710,8 @@ def main() -> None:
 
     threading.Thread(target=_periodic_ip_broadcast, daemon=True).start()
 
-    while True:
-        time.sleep(60)
+    start_ble_advertisement()
+    publish_gatt_only(ble)
 
 
 if __name__ == "__main__":
