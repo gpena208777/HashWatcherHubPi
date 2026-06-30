@@ -254,27 +254,16 @@ def start_ble_advertisement() -> None:
         print(f"[{now_iso()}] btmgmt not found; BLE advertisement may not be visible", flush=True)
         return
 
+    btmgmt_command = f"btmgmt add-adv -g -c -d {DEVICE_NAME_ADV_HEX} {BLE_ADV_INSTANCE_ID}"
+    launch_cmd = ["script", "-q", "-c", btmgmt_command, "/dev/null"] if has_cmd("script") else btmgmt_command.split()
     try:
-        proc = subprocess.Popen([
-            "btmgmt",
-            "add-adv",
-            "-g",
-            "-c",
-            "-d",
-            DEVICE_NAME_ADV_HEX,
-            BLE_ADV_INSTANCE_ID,
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-        if proc.poll() is None:
-            print(f"[{now_iso()}] BLE advertising as {DEVICE_NAME}", flush=True)
-            return
-        if proc.returncode == 0:
-            print(f"[{now_iso()}] BLE advertising as {DEVICE_NAME}", flush=True)
-            return
-        print(f"[{now_iso()}] BLE advertising failed: btmgmt exited {proc.returncode}", flush=True)
+        subprocess.Popen(launch_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
         print(f"[{now_iso()}] BLE advertising failed: {exc}", flush=True)
         return
+
+    time.sleep(1)
+    print(f"[{now_iso()}] BLE advertising command sent for {DEVICE_NAME}", flush=True)
 
 
 def publish_gatt_only(ble: peripheral.Peripheral) -> None:
