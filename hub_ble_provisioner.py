@@ -19,8 +19,10 @@ PAIR_STATUS_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000004"
 DETAIL_STATUS_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000005"
 IP_ONLY_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000006"
 
-# Keep one fixed BLE name so a single generic image works for all shipped hubs.
-DEVICE_NAME = "hashwatcherhub"
+# Keep the advertised BLE name short enough to fit beside the 128-bit service
+# UUID in a legacy 31-byte advertisement. The hostname/mDNS name remains
+# hashwatcherhub; the app discovers this service UUID and accepts this alias.
+DEVICE_NAME = "HWHub"
 
 # Pair status codes sent over BLE for iOS HubOnboardingView to display
 PAIR_STATUS_CREDS_RECEIVED = "creds-received"
