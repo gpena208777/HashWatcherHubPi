@@ -3438,7 +3438,7 @@ class HubAgent:
             self._persist_runtime_config()
             return self.get_runtime_config()
 
-    def _purge_all_wifi_credentials(self) -> None:
+    def _purge_all_wifi_credentials(self) -> Dict[str, Any]:
         """Remove Wi-Fi credentials from all common Pi network config sources."""
         wifi_creds_path = os.getenv("LAST_WIFI_PATH", "/opt/hashwatcher-hub-pi/last_wifi_credentials.json")
         try:
@@ -3447,66 +3447,18 @@ class HubAgent:
         except Exception:
             pass
 
-        script = r"""
-set -e
-
-# Remove all known NetworkManager wireless profiles.
-nmcli -t -f NAME,TYPE connection show 2>/dev/null | while IFS=: read -r name type; do
-    if echo "$type" | grep -q wireless; then
-        nmcli connection delete "$name" 2>/dev/null || true
-    fi
-done
-
-# Clear runtime NM connection files as belt-and-suspenders.
-rm -f /run/NetworkManager/system-connections/*wlan*.nmconnection 2>/dev/null || true
-rm -f /run/NetworkManager/system-connections/*wireless*.nmconnection 2>/dev/null || true
-
-# Remove netplan files containing Wi-Fi config.
-for yf in /etc/netplan/*.yaml; do
-    [ -f "$yf" ] || continue
-    if grep -qE 'wifis:|access-points:' "$yf" 2>/dev/null; then
-        rm -f "$yf"
-    fi
-done
-
-# Strip the wifi stanza from /boot/firmware/network-config if present.
-BOOT_CFG="/boot/firmware/network-config"
-if [ -f "$BOOT_CFG" ]; then
-    python3 -c "
-import pathlib
-p = pathlib.Path('$BOOT_CFG')
-lines = p.read_text(encoding='utf-8', errors='ignore').splitlines(keepends=True)
-out = []
-skip = False
-for line in lines:
-    stripped = line.lstrip()
-    if stripped.startswith('wifis:'):
-        skip = True
-        continue
-    if skip:
-        if line[:1] in (' ', '\t') or stripped == '':
-            continue
-        skip = False
-    out.append(line)
-p.write_text(''.join(out), encoding='utf-8')
-"
-fi
-
-# Prevent cloud-init from re-writing network config on next boot.
-mkdir -p /etc/cloud/cloud.cfg.d
-echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
-
-# Disconnect wlan0 and apply netplan if available.
-nmcli device disconnect wlan0 2>/dev/null || true
-netplan apply 2>/dev/null || true
-"""
+        helper_path = os.getenv("WIFI_RESET_HELPER_PATH", "/opt/hashwatcher-hub-pi/wifi_reset_helper.sh")
         try:
-            subprocess.run(
-                ["sudo", "bash", "-c", script],
+            result = subprocess.run(
+                ["sudo", "-n", helper_path],
                 capture_output=True, text=True, timeout=30,
             )
-        except Exception:
-            pass
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                return {"ok": False, "error": detail or f"{helper_path} exited {result.returncode}"}
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def _force_disconnect_wifi(self) -> None:
         """Aggressively disconnect wlan0 so HTTP access drops before reboot."""
@@ -3558,7 +3510,9 @@ netplan apply 2>/dev/null || true
         Tailscale and miner pairing are left untouched.
         """
         self._force_disconnect_wifi()
-        self._purge_all_wifi_credentials()
+        purge_result = self._purge_all_wifi_credentials()
+        if not purge_result.get("ok"):
+            return {"ok": False, "error": f"Wi-Fi credential purge failed: {purge_result.get('error')}"}
         self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=3, source="wifi-reset", sync_before=True)
 
         return {"ok": True, "message": "Wi-Fi disconnected and credentials cleared. Hub will reboot in ~3 seconds. Re-provision via BLE."}
@@ -3566,7 +3520,9 @@ netplan apply 2>/dev/null || true
     def disconnect_and_reset_wifi(self) -> Dict[str, Any]:
         """Force disconnect wlan0 immediately, then clear all Wi-Fi credentials and reboot."""
         self._force_disconnect_wifi()
-        self._purge_all_wifi_credentials()
+        purge_result = self._purge_all_wifi_credentials()
+        if not purge_result.get("ok"):
+            return {"ok": False, "error": f"Wi-Fi credential purge failed: {purge_result.get('error')}"}
         self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=2, source="wifi-reset", sync_before=True)
 
         return {
@@ -3601,7 +3557,13 @@ netplan apply 2>/dev/null || true
             except Exception:
                 pass
 
-        self._purge_all_wifi_credentials()
+        purge_result = self._purge_all_wifi_credentials()
+        if not purge_result.get("ok"):
+            return {
+                "ok": False,
+                "error": f"Factory reset aborted because Wi-Fi credential purge failed: {purge_result.get('error')}",
+                "tailscale": tailscale_result,
+            }
         self._schedule_sudo_command(["sudo", "-n", "reboot"], delay_seconds=3, source="factory-reset", sync_before=True)
 
         return {

@@ -419,6 +419,7 @@ required_files=(
     hub_ble_provisioner.py
     tailscale_setup.py
     ota_update_helper.sh
+    wifi_reset_helper.sh
     requirements.txt
     hashwatcher-hub.service
     hashwatcher-ble-provisioner.service
@@ -681,6 +682,7 @@ EOF
     done
     install -m 0644 "${src}/${VENDORED_BLUEZERO_WHEEL_REL}" "${INSTALL_DIR}/${VENDORED_BLUEZERO_WHEEL_REL}"
     install -m 0755 "${src}/ota_update_helper.sh" "${INSTALL_DIR}/ota_update_helper.sh"
+    install -m 0755 "${src}/wifi_reset_helper.sh" "${INSTALL_DIR}/wifi_reset_helper.sh"
 
     install -m 0644 "${src}/VERSION" "${INSTALL_DIR}/VERSION"
 
