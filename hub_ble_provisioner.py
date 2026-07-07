@@ -598,41 +598,57 @@ def reset_bluetooth_stack() -> None:
         print(f"[{now_iso()}] bluetooth restart warning: {exc}", flush=True)
 
 
-def start_name_advertisement() -> None:
-    """Keep a minimal BlueZ advertisement alive with the required hub name.
-
-    Bluezero's default advertisement includes our 128-bit service UUID plus the
-    full local name, which BlueZ rejects on this hardware. A name-only
-    advertisement is enough for the app to discover the hub; after connection,
-    CoreBluetooth discovers the provision service from the registered GATT app.
-    """
+def run_bluetoothctl_advertisement(commands: list[str], label: str) -> bool:
     try:
-        commands = "\n".join(
-            [
-                "discoverable-timeout 0",
-                "discoverable on",
-                "pairable off",
-                "menu advertise",
-                f"name {DEVICE_NAME}",
-                "back",
-                "advertise on",
-                "",
-            ]
-        )
         result = subprocess.run(
             ["bluetoothctl"],
-            input=commands,
+            input="\n".join(commands + [""]),
             capture_output=True,
             text=True,
             timeout=10,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
-            print(f"[{now_iso()}] bluetoothctl advertiser failed: {detail or result.returncode}", flush=True)
-        else:
-            print(f"[{now_iso()}] Started name-only BLE advertisement as {DEVICE_NAME}", flush=True)
+            print(f"[{now_iso()}] bluetoothctl {label} advertiser failed: {detail or result.returncode}", flush=True)
+            return False
+        print(f"[{now_iso()}] Started {label} BLE advertisement", flush=True)
+        return True
     except Exception as exc:
-        print(f"[{now_iso()}] Failed to start name-only BLE advertisement: {exc}", flush=True)
+        print(f"[{now_iso()}] Failed to start {label} BLE advertisement: {exc}", flush=True)
+        return False
+
+
+def start_provisioning_advertisements() -> None:
+    """Start separate name and UUID advertisements.
+
+    Bluezero's default advertisement includes our 128-bit service UUID plus the
+    full local name, which BlueZ rejects on this hardware due to legacy BLE
+    payload size. Two small advertisements work: one carries the exact required
+    hub name, and one carries the provisioning service UUID for filtered scans.
+    """
+    run_bluetoothctl_advertisement(
+        [
+            "discoverable-timeout 0",
+            "discoverable on",
+            "pairable off",
+            "menu advertise",
+            f"name {DEVICE_NAME}",
+            "back",
+            "advertise on",
+            "quit",
+        ],
+        f"name-only ({DEVICE_NAME})",
+    )
+    run_bluetoothctl_advertisement(
+        [
+            "menu advertise",
+            f"uuids {SERVICE_UUID}",
+            "back",
+            "advertise on",
+            "quit",
+        ],
+        f"service-uuid ({SERVICE_UUID})",
+    )
 
 
 def main() -> None:
@@ -693,7 +709,7 @@ def main() -> None:
         read_callback=ip_only_read_callback,
     )
 
-    start_name_advertisement()
+    start_provisioning_advertisements()
     ble.ad_manager.register_advertisement = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
     _ble_peripheral = ble
     ble.publish()
