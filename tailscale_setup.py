@@ -59,7 +59,18 @@ def _rm_bin() -> str:
 
 
 def _sudo_run(cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(["sudo"] + cmd, check=False, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(["sudo", "-n"] + cmd, check=False, capture_output=True, text=True, timeout=timeout)
+
+
+def _sudo_write_text(path: str, content: str, timeout: int = 10) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["sudo", "-n", "tee", path],
+        input=content,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 def _ensure_ip_forwarding() -> None:
@@ -749,9 +760,14 @@ def repair_usb_gadget() -> Dict[str, Any]:
                         with open(cfg_path, "r") as f:
                             lines = f.readlines()
                         new_lines = [l for l in lines if "dtoverlay=dwc2,dr_mode=host" not in l]
-                        result = _sudo_run(["tee", cfg_path], timeout=5)
-                        _sudo_run(["bash", "-c", f"printf '%s' '{''.join(new_lines)}' > {cfg_path}"], timeout=5)
-                        actions_taken.append("Removed conflicting dtoverlay=dwc2,dr_mode=host from config.txt (reboot needed)")
+                        if new_lines == lines:
+                            break
+                        result = _sudo_write_text(cfg_path, "".join(new_lines), timeout=10)
+                        if result.returncode != 0:
+                            detail = (result.stderr or result.stdout or "").strip()
+                            errors.append(f"Failed to write {cfg_path}: {detail or result.returncode}")
+                        else:
+                            actions_taken.append("Removed conflicting dtoverlay=dwc2,dr_mode=host from config.txt (reboot needed)")
                     except Exception as exc:
                         errors.append(f"Failed to fix config.txt: {exc}")
                     break
@@ -759,25 +775,42 @@ def repair_usb_gadget() -> Dict[str, Any]:
         if action == "install_usb_gadget_service":
             try:
                 svc_path = "/etc/systemd/system/usb0-gadget.service"
-                proc = _sudo_run(["bash", "-c", f"cat > {svc_path} << 'SVCEOF'\n{USB_GADGET_SERVICE}SVCEOF"], timeout=5)
+                proc = _sudo_write_text(svc_path, USB_GADGET_SERVICE, timeout=10)
                 if proc.returncode != 0:
-                    errors.append(f"Failed to write service file: {proc.stderr}")
+                    detail = (proc.stderr or proc.stdout or "").strip()
+                    errors.append(f"Failed to write service file: {detail or proc.returncode}")
                 else:
-                    _sudo_run(["systemctl", "daemon-reload"])
-                    _sudo_run(["systemctl", "enable", "usb0-gadget.service"])
-                    _sudo_run(["systemctl", "start", "usb0-gadget.service"])
-                    actions_taken.append("Installed and started usb0-gadget.service")
+                    for cmd, label in (
+                        (["systemctl", "daemon-reload"], "reload systemd"),
+                        (["systemctl", "enable", "usb0-gadget.service"], "enable usb0-gadget.service"),
+                        (["systemctl", "start", "usb0-gadget.service"], "start usb0-gadget.service"),
+                    ):
+                        result = _sudo_run(cmd)
+                        if result.returncode != 0:
+                            detail = (result.stderr or result.stdout or "").strip()
+                            errors.append(f"Failed to {label}: {detail or result.returncode}")
+                    if not errors:
+                        actions_taken.append("Installed and started usb0-gadget.service")
             except Exception as exc:
                 errors.append(f"Failed to install gadget service: {exc}")
 
         if action == "start_usb_gadget_service":
-            _sudo_run(["systemctl", "start", "usb0-gadget.service"])
-            actions_taken.append("Started usb0-gadget.service")
+            result = _sudo_run(["systemctl", "start", "usb0-gadget.service"])
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                errors.append(f"Failed to start usb0-gadget.service: {detail or result.returncode}")
+            else:
+                actions_taken.append("Started usb0-gadget.service")
 
         if action == "assign_usb0_ip":
-            _sudo_run(["ip", "link", "set", "usb0", "up"])
-            _sudo_run(["ip", "addr", "add", f"{USB_GADGET_IP}/16", "dev", "usb0"])
-            actions_taken.append(f"Assigned {USB_GADGET_IP}/16 to usb0")
+            link_result = _sudo_run(["ip", "link", "set", "usb0", "up"])
+            addr_result = _sudo_run(["ip", "addr", "add", f"{USB_GADGET_IP}/16", "dev", "usb0"])
+            for label, result in (("bring usb0 up", link_result), ("assign usb0 IP", addr_result)):
+                detail = (result.stderr or result.stdout or "").strip()
+                if result.returncode != 0 and "File exists" not in detail:
+                    errors.append(f"Failed to {label}: {detail or result.returncode}")
+            if not errors:
+                actions_taken.append(f"Assigned {USB_GADGET_IP}/16 to usb0")
 
     return {
         "ok": len(errors) == 0,

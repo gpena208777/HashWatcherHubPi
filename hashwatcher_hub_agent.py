@@ -411,6 +411,7 @@ class HubAgent:
         self._update_progress: Dict[str, Any] = self._read_update_progress() or {"stage": "idle"}
         self._led_lock = threading.Lock()
         self._led_default_trigger: Optional[str] = None
+        self._self_heal_retry_after: Dict[str, float] = {}
 
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
@@ -5388,11 +5389,18 @@ netplan apply 2>/dev/null || true
                     repairable = finding.get("autoRepairable", False)
 
                     if component == "usb_gadget" and repairable:
+                        retry_key = f"{component}:{issue}:{finding.get('repairAction', '')}"
+                        retry_after = self._self_heal_retry_after.get(retry_key, 0)
+                        if retry_after > time.time():
+                            continue
+
                         self._log("self-heal", f"Auto-repairing USB gadget: {issue}", level="info")
                         result = tailscale_setup.repair_usb_gadget()
                         if result.get("ok"):
+                            self._self_heal_retry_after.pop(retry_key, None)
                             self._log("self-heal", f"USB gadget repair succeeded: {result.get('actionsTaken', [])}", level="info")
                         else:
+                            self._self_heal_retry_after[retry_key] = time.time() + 3600
                             self._log("self-heal", f"USB gadget repair had errors: {result.get('errors', [])}", level="warn")
 
                     elif component == "tailscale":

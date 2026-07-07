@@ -734,6 +734,9 @@ hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/journalctl *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/rm -f /var/lib/tailscale/tailscaled.state, /usr/bin/rm -f /var/lib/tailscale/tailscaled.state.tmp, /usr/bin/rm -f /var/lib/tailscale/tailscaled.state.bak
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /bin/rm -f /var/lib/tailscale/tailscaled.state, /bin/rm -f /var/lib/tailscale/tailscaled.state.tmp, /bin/rm -f /var/lib/tailscale/tailscaled.state.bak
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /boot/firmware/config.txt, /usr/bin/tee /boot/config.txt, /usr/bin/tee /etc/systemd/system/usb0-gadget.service
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload, /usr/bin/systemctl enable usb0-gadget.service, /usr/bin/systemctl start usb0-gadget.service
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/ip link set usb0 up, /usr/sbin/ip addr add 169.254.75.1/16 dev usb0
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit hashwatcher-hub-update --collect --service-type=oneshot /opt/hashwatcher-hub-pi/ota_update_helper.sh *
 EOF
