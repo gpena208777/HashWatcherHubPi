@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import atexit
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -39,6 +41,7 @@ _ip_status_value: list[int] = list(b"waiting")
 _pair_status_value: list[int] = list(b"idle")
 _detail_status_value: list[int] = list(b'{"state":"idle"}')
 _ip_only_value: list[int] = list(b"no-ip")
+_advertiser_process: Optional[subprocess.Popen] = None
 
 
 def fsync_parent_dir(path: str) -> None:
@@ -579,6 +582,29 @@ def ensure_adapter_powered(adapter_addr: str) -> None:
     raise RuntimeError(f"Adapter {adapter_addr} not found")
 
 
+def stop_name_advertisement() -> None:
+    """Stop the bluetoothctl client that owns our name-only advertisement."""
+    global _advertiser_process
+    proc = _advertiser_process
+    _advertiser_process = None
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        if proc.stdin:
+            proc.stdin.write("quit\n")
+            proc.stdin.flush()
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def start_name_advertisement() -> None:
     """Keep a minimal BlueZ advertisement alive with the required hub name.
 
@@ -587,6 +613,8 @@ def start_name_advertisement() -> None:
     advertisement is enough for the app to discover the hub; after connection,
     CoreBluetooth discovers the provision service from the registered GATT app.
     """
+    global _advertiser_process
+    stop_name_advertisement()
     try:
         commands = "\n".join(
             [
@@ -597,23 +625,36 @@ def start_name_advertisement() -> None:
                 "",
             ]
         )
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["bluetoothctl"],
-            input=commands,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=10,
         )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            print(f"[{now_iso()}] bluetoothctl advertiser failed: {detail or result.returncode}", flush=True)
-        else:
-            print(f"[{now_iso()}] Started name-only BLE advertisement as {DEVICE_NAME}", flush=True)
+        if not proc.stdin:
+            raise RuntimeError("bluetoothctl stdin was not available")
+        proc.stdin.write(commands)
+        proc.stdin.flush()
+        time.sleep(1)
+        if proc.poll() is not None:
+            raise RuntimeError(f"bluetoothctl advertiser exited with {proc.returncode}")
+        _advertiser_process = proc
+        print(f"[{now_iso()}] Started persistent name-only BLE advertisement as {DEVICE_NAME}", flush=True)
     except Exception as exc:
         print(f"[{now_iso()}] Failed to start name-only BLE advertisement: {exc}", flush=True)
 
 
+def handle_shutdown(signum: int, _frame: object) -> None:
+    stop_name_advertisement()
+    raise SystemExit(128 + signum)
+
+
 def main() -> None:
+    atexit.register(stop_name_advertisement)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
     adapter_addr = find_adapter_address()
     ensure_adapter_powered(adapter_addr)
     print(
