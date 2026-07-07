@@ -35,6 +35,7 @@ WIFI_INTERFACE = os.getenv("WIFI_INTERFACE", "wlan0")
 NMCLI_WAIT_SECONDS = int(os.getenv("NMCLI_WAIT_SECONDS", "60"))
 
 _ble_peripheral: Optional[peripheral.Peripheral] = None
+_ble_advertiser_proc: Optional[subprocess.Popen] = None
 _ip_status_value: list[int] = list(b"waiting")
 _pair_status_value: list[int] = list(b"idle")
 _detail_status_value: list[int] = list(b'{"state":"idle"}')
@@ -579,6 +580,52 @@ def ensure_adapter_powered(adapter_addr: str) -> None:
     raise RuntimeError(f"Adapter {adapter_addr} not found")
 
 
+def start_name_advertisement() -> None:
+    """Keep a minimal BlueZ advertisement alive with the required hub name.
+
+    Bluezero's default advertisement includes our 128-bit service UUID plus the
+    full local name, which BlueZ rejects on this hardware. A name-only
+    advertisement is enough for the app to discover the hub; after connection,
+    CoreBluetooth discovers the provision service from the registered GATT app.
+    """
+    global _ble_advertiser_proc
+
+    if _ble_advertiser_proc and _ble_advertiser_proc.poll() is None:
+        return
+
+    try:
+        proc = subprocess.Popen(
+            ["bluetoothctl"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert proc.stdin is not None
+        proc.stdin.write(
+            "\n".join(
+                [
+                    "menu advertise",
+                    "clear uuids",
+                    f"name {DEVICE_NAME}",
+                    "discoverable on",
+                    "back",
+                    "advertise on",
+                    "",
+                ]
+            )
+        )
+        proc.stdin.flush()
+        _ble_advertiser_proc = proc
+        time.sleep(1)
+        if proc.poll() is not None:
+            print(f"[{now_iso()}] bluetoothctl advertiser exited early with {proc.returncode}", flush=True)
+        else:
+            print(f"[{now_iso()}] Started name-only BLE advertisement as {DEVICE_NAME}", flush=True)
+    except Exception as exc:
+        print(f"[{now_iso()}] Failed to start name-only BLE advertisement: {exc}", flush=True)
+
+
 def main() -> None:
     adapter_addr = find_adapter_address()
     ensure_adapter_powered(adapter_addr)
@@ -636,18 +683,8 @@ def main() -> None:
         read_callback=ip_only_read_callback,
     )
 
-    def _create_name_only_advertisement() -> None:
-        """Advertise the hub name without the 128-bit service UUID.
-
-        BlueZ rejects the legacy advertisement when both the full
-        "hashwatcherhub" local name and our 128-bit service UUID are included.
-        The app scans broadly, matches this stable name, then discovers the
-        provision service UUID after connecting.
-        """
-        if ble.local_name:
-            ble.advert.local_name = ble.local_name
-
-    ble._create_advertisement = _create_name_only_advertisement  # type: ignore[attr-defined]
+    start_name_advertisement()
+    ble.ad_manager.register_advertisement = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
     _ble_peripheral = ble
     ble.publish()
     emit_detail_status("ble-ready")
