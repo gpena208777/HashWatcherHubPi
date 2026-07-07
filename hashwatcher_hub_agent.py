@@ -3857,6 +3857,12 @@ class HubAgent:
                     stderr = result.stderr.strip() or result.stdout.strip()
                     self._set_update_progress({"stage": "failed", "percent": 0, "error": f"update handoff failed: {stderr}"})
                     return
+            except subprocess.TimeoutExpired:
+                self._set_update_progress({
+                    **progress,
+                    "message": "Installer handoff is still running. Waiting for package install to finish...",
+                })
+                return
             except Exception as exc:
                 self._set_update_progress({"stage": "failed", "percent": 0, "error": f"Install failed: {exc}"})
                 return
