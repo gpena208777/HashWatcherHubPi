@@ -21,6 +21,8 @@ IP_ONLY_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000006"
 
 # Keep one fixed BLE name so a single generic image works for all shipped hubs.
 DEVICE_NAME = "hashwatcherhub"
+DEVICE_NAME_ADV_HEX = "0F096861736877617463686572687562"
+BLE_ADV_INSTANCE_ID = "1"
 
 # Pair status codes sent over BLE for iOS HubOnboardingView to display
 PAIR_STATUS_CREDS_RECEIVED = "creds-received"
@@ -39,6 +41,7 @@ _ip_status_value: list[int] = list(b"waiting")
 _pair_status_value: list[int] = list(b"idle")
 _detail_status_value: list[int] = list(b'{"state":"idle"}')
 _ip_only_value: list[int] = list(b"no-ip")
+_advertisement_lock = threading.Lock()
 
 
 def fsync_parent_dir(path: str) -> None:
@@ -579,80 +582,44 @@ def ensure_adapter_powered(adapter_addr: str) -> None:
     raise RuntimeError(f"Adapter {adapter_addr} not found")
 
 
-def reset_bluetooth_stack() -> None:
-    """Restart BlueZ once so stale advertisement instances are cleared."""
+def start_ble_advertisement(reason: str = "startup") -> None:
+    """Advertise using the v1.0.12 btmgmt path that phones saw reliably."""
+    if not has_cmd("btmgmt"):
+        print(f"[{now_iso()}] btmgmt not found; BLE advertisement may not be visible", flush=True)
+        return
+
+    with _advertisement_lock:
+        safe_shell(["btmgmt", "rm-adv", BLE_ADV_INSTANCE_ID])
+        btmgmt_command = f"btmgmt add-adv -g -c -d {DEVICE_NAME_ADV_HEX} {BLE_ADV_INSTANCE_ID}"
+        launch_cmd = ["script", "-q", "-c", btmgmt_command, "/dev/null"] if has_cmd("script") else btmgmt_command.split()
+        try:
+            subprocess.Popen(launch_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            print(f"[{now_iso()}] BLE advertising failed ({reason}): {exc}", flush=True)
+            return
+
+    time.sleep(1)
+    print(f"[{now_iso()}] BLE advertising command sent for {DEVICE_NAME} ({reason})", flush=True)
+
+
+def publish_gatt_only(ble: peripheral.Peripheral) -> None:
+    """Register GATT without Bluezero's advertisement registration."""
+    for service in ble.services:
+        ble.app.add_managed_object(service)
+    for chars in ble.characteristics:
+        ble.app.add_managed_object(chars)
+    for desc in ble.descriptors:
+        ble.app.add_managed_object(desc)
+    if not ble.dongle.powered:
+        ble.dongle.powered = True
+    ble.srv_mng.register_application(ble.app, {})
     try:
-        result = subprocess.run(
-            ["systemctl", "restart", "bluetooth"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            print(f"[{now_iso()}] bluetooth restart warning: {detail or result.returncode}", flush=True)
-        else:
-            print(f"[{now_iso()}] Restarted bluetooth service before advertising", flush=True)
-        time.sleep(3)
-    except Exception as exc:
-        print(f"[{now_iso()}] bluetooth restart warning: {exc}", flush=True)
-
-
-def run_bluetoothctl_advertisement(commands: list[str], label: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["bluetoothctl"],
-            input="\n".join(commands + [""]),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            print(f"[{now_iso()}] bluetoothctl {label} advertiser failed: {detail or result.returncode}", flush=True)
-            return False
-        print(f"[{now_iso()}] Started {label} BLE advertisement", flush=True)
-        return True
-    except Exception as exc:
-        print(f"[{now_iso()}] Failed to start {label} BLE advertisement: {exc}", flush=True)
-        return False
-
-
-def start_provisioning_advertisements() -> None:
-    """Start separate name and UUID advertisements.
-
-    Bluezero's default advertisement includes our 128-bit service UUID plus the
-    full local name, which BlueZ rejects on this hardware due to legacy BLE
-    payload size. Two small advertisements work: one carries the exact required
-    hub name, and one carries the provisioning service UUID for filtered scans.
-    """
-    run_bluetoothctl_advertisement(
-        [
-            "discoverable-timeout 0",
-            "discoverable on",
-            "pairable off",
-            "menu advertise",
-            f"name {DEVICE_NAME}",
-            "back",
-            "advertise on",
-            "quit",
-        ],
-        f"name-only ({DEVICE_NAME})",
-    )
-    run_bluetoothctl_advertisement(
-        [
-            "menu advertise",
-            f"uuids {SERVICE_UUID}",
-            "back",
-            "advertise on",
-            "quit",
-        ],
-        f"service-uuid ({SERVICE_UUID})",
-    )
+        ble.mainloop.run()
+    except KeyboardInterrupt:
+        ble.mainloop.quit()
 
 
 def main() -> None:
-    reset_bluetooth_stack()
     adapter_addr = find_adapter_address()
     ensure_adapter_powered(adapter_addr)
     print(
@@ -709,11 +676,7 @@ def main() -> None:
         read_callback=ip_only_read_callback,
     )
 
-    start_provisioning_advertisements()
-    ble.ad_manager.register_advertisement = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
     _ble_peripheral = ble
-    ble.publish()
-    emit_detail_status("ble-ready")
 
     def _reconnect_saved_wifi() -> None:
         """On boot, re-apply last known credentials so power cycles keep Wi-Fi working."""
@@ -775,8 +738,14 @@ def main() -> None:
 
     threading.Thread(target=_periodic_ip_broadcast, daemon=True).start()
 
-    while True:
-        time.sleep(60)
+    def _advertisement_watchdog() -> None:
+        while True:
+            time.sleep(60)
+            start_ble_advertisement("watchdog")
+
+    start_ble_advertisement("startup")
+    threading.Thread(target=_advertisement_watchdog, daemon=True).start()
+    publish_gatt_only(ble)
 
 
 if __name__ == "__main__":
