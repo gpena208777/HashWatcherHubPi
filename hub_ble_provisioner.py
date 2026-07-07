@@ -35,7 +35,6 @@ WIFI_INTERFACE = os.getenv("WIFI_INTERFACE", "wlan0")
 NMCLI_WAIT_SECONDS = int(os.getenv("NMCLI_WAIT_SECONDS", "60"))
 
 _ble_peripheral: Optional[peripheral.Peripheral] = None
-_ble_advertiser_proc: Optional[subprocess.Popen] = None
 _ip_status_value: list[int] = list(b"waiting")
 _pair_status_value: list[int] = list(b"idle")
 _detail_status_value: list[int] = list(b'{"state":"idle"}')
@@ -588,38 +587,26 @@ def start_name_advertisement() -> None:
     advertisement is enough for the app to discover the hub; after connection,
     CoreBluetooth discovers the provision service from the registered GATT app.
     """
-    global _ble_advertiser_proc
-
-    if _ble_advertiser_proc and _ble_advertiser_proc.poll() is None:
-        return
-
     try:
-        proc = subprocess.Popen(
+        commands = "\n".join(
+            [
+                "menu advertise",
+                f"name {DEVICE_NAME}",
+                "back",
+                "advertise on",
+                "",
+            ]
+        )
+        result = subprocess.run(
             ["bluetoothctl"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
+            input=commands,
+            capture_output=True,
             text=True,
+            timeout=10,
         )
-        assert proc.stdin is not None
-        proc.stdin.write(
-            "\n".join(
-                [
-                    "menu advertise",
-                    "clear uuids",
-                    f"name {DEVICE_NAME}",
-                    "discoverable on",
-                    "back",
-                    "advertise on",
-                    "",
-                ]
-            )
-        )
-        proc.stdin.flush()
-        _ble_advertiser_proc = proc
-        time.sleep(1)
-        if proc.poll() is not None:
-            print(f"[{now_iso()}] bluetoothctl advertiser exited early with {proc.returncode}", flush=True)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            print(f"[{now_iso()}] bluetoothctl advertiser failed: {detail or result.returncode}", flush=True)
         else:
             print(f"[{now_iso()}] Started name-only BLE advertisement as {DEVICE_NAME}", flush=True)
     except Exception as exc:
