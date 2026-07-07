@@ -275,8 +275,20 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def safe_shell(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+def safe_shell(cmd: list[str], timeout_seconds: int = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr or "command timed out")
 
 
 def has_cmd(name: str) -> bool:
@@ -589,7 +601,7 @@ def start_ble_advertisement(reason: str = "startup") -> None:
         return
 
     with _advertisement_lock:
-        safe_shell(["btmgmt", "rm-adv", BLE_ADV_INSTANCE_ID])
+        safe_shell(["btmgmt", "rm-adv", BLE_ADV_INSTANCE_ID], timeout_seconds=2)
         btmgmt_command = f"btmgmt add-adv -g -c -d {DEVICE_NAME_ADV_HEX} {BLE_ADV_INSTANCE_ID}"
         launch_cmd = ["script", "-q", "-c", btmgmt_command, "/dev/null"] if has_cmd("script") else btmgmt_command.split()
         try:
