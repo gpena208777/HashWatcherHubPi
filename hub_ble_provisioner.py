@@ -609,6 +609,9 @@ def start_name_advertisement() -> None:
     try:
         commands = "\n".join(
             [
+                "discoverable-timeout 0",
+                "discoverable on",
+                "pairable off",
                 "menu advertise",
                 f"name {DEVICE_NAME}",
                 "back",
