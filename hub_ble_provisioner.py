@@ -20,9 +20,7 @@ DETAIL_STATUS_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000005"
 IP_ONLY_CHAR_UUID = "A8F0C001-2D4F-4B2A-8A9E-000000000006"
 
 # Keep one fixed BLE name so a single generic image works for all shipped hubs.
-DEVICE_NAME = "HashWatcherHub"
-DEVICE_NAME_ADV_HEX = "0F094861736857617463686572487562"
-BLE_ADV_INSTANCE_ID = "1"
+DEVICE_NAME = "hashwatcherhub"
 
 # Pair status codes sent over BLE for iOS HubOnboardingView to display
 PAIR_STATUS_CREDS_RECEIVED = "creds-received"
@@ -41,6 +39,52 @@ _ip_status_value: list[int] = list(b"waiting")
 _pair_status_value: list[int] = list(b"idle")
 _detail_status_value: list[int] = list(b'{"state":"idle"}')
 _ip_only_value: list[int] = list(b"no-ip")
+
+
+def fsync_parent_dir(path: str) -> None:
+    directory = os.path.dirname(path) or "."
+    dir_fd = None
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        os.fsync(dir_fd)
+    except Exception:
+        pass
+    finally:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except Exception:
+                pass
+
+
+def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+        fsync_parent_dir(path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def atomic_write_json(path: str, payload: dict, mode: int = 0o600) -> None:
+    raw = (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
+    atomic_write_bytes(path, raw, mode=mode)
+
+
+def atomic_write_text(path: str, text: str, mode: int = 0o600) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
 
 
 def get_local_ip() -> Optional[str]:
@@ -228,59 +272,12 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def safe_shell(cmd: list[str], timeout_seconds: int = 30) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return subprocess.CompletedProcess(cmd, 124, stdout, stderr or "command timed out")
+def safe_shell(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=False, capture_output=True, text=True)
 
 
 def has_cmd(name: str) -> bool:
     return safe_shell(["bash", "-lc", f"command -v {name} >/dev/null 2>&1"]).returncode == 0
-
-
-def start_ble_advertisement() -> None:
-    """Advertise with btmgmt; Bluezero's D-Bus advert is rejected on Pi BlueZ 5.82."""
-    if not has_cmd("btmgmt"):
-        print(f"[{now_iso()}] btmgmt not found; BLE advertisement may not be visible", flush=True)
-        return
-
-    btmgmt_command = f"btmgmt add-adv -g -c -d {DEVICE_NAME_ADV_HEX} {BLE_ADV_INSTANCE_ID}"
-    launch_cmd = ["script", "-q", "-c", btmgmt_command, "/dev/null"] if has_cmd("script") else btmgmt_command.split()
-    try:
-        subprocess.Popen(launch_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as exc:
-        print(f"[{now_iso()}] BLE advertising failed: {exc}", flush=True)
-        return
-
-    time.sleep(1)
-    print(f"[{now_iso()}] BLE advertising command sent for {DEVICE_NAME}", flush=True)
-
-
-def publish_gatt_only(ble: peripheral.Peripheral) -> None:
-    """Register GATT without Bluezero's advertisement registration."""
-    for service in ble.services:
-        ble.app.add_managed_object(service)
-    for chars in ble.characteristics:
-        ble.app.add_managed_object(chars)
-    for desc in ble.descriptors:
-        ble.app.add_managed_object(desc)
-    if not ble.dongle.powered:
-        ble.dongle.powered = True
-    ble.srv_mng.register_application(ble.app, {})
-    try:
-        ble.mainloop.run()
-    except KeyboardInterrupt:
-        ble.mainloop.quit()
 
 
 def _short_err(result: subprocess.CompletedProcess, limit: int = 160) -> str:
@@ -309,10 +306,7 @@ def save_wifi_marker(ssid: str, password: str) -> None:
         "password": password,
         "updatedAtIso": now_iso(),
     }
-    os.makedirs(os.path.dirname(LAST_WIFI_PATH), exist_ok=True)
-    with open(LAST_WIFI_PATH, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    os.chmod(LAST_WIFI_PATH, 0o600)
+    atomic_write_json(LAST_WIFI_PATH, payload, mode=0o600)
 
 
 def load_wifi_marker() -> Optional[tuple[str, str]]:
@@ -426,18 +420,20 @@ def apply_wifi_wpa_supplicant(ssid: str, password: str) -> tuple[bool, Optional[
     with open(wpa_conf, "r", encoding="utf-8") as f:
         existing = f.read()
 
+    cleaned = existing
     if escaped_ssid in existing:
-        # Remove the old network block for this SSID so we can write the updated one
+        # Remove the old network block for this SSID so we can write the updated one.
         cleaned = re.sub(
             r'\nnetwork=\{[^}]*ssid="' + re.escape(escaped_ssid) + r'"[^}]*\}\n?',
             "",
             existing,
         )
-        with open(wpa_conf, "w", encoding="utf-8") as f:
-            f.write(cleaned)
 
-    with open(wpa_conf, "a", encoding="utf-8") as f:
-        f.write(network_block)
+    try:
+        mode = os.stat(wpa_conf).st_mode & 0o777
+    except Exception:
+        mode = 0o600
+    atomic_write_text(wpa_conf, cleaned.rstrip() + network_block, mode=mode)
 
     if has_cmd("wpa_cli"):
         result = safe_shell(["wpa_cli", "-i", WIFI_INTERFACE, "reconfigure"])
@@ -514,6 +510,8 @@ def _handle_command(raw: str) -> bool:
 
 def _do_reboot() -> None:
     time.sleep(2)
+    safe_shell(["sync"])
+    time.sleep(1)
     safe_shell(["sudo", "reboot"])
 
 
@@ -638,6 +636,8 @@ def main() -> None:
         read_callback=ip_only_read_callback,
     )
     _ble_peripheral = ble
+    ble.publish()
+    emit_detail_status("ble-ready")
 
     def _reconnect_saved_wifi() -> None:
         """On boot, re-apply last known credentials so power cycles keep Wi-Fi working."""
@@ -699,8 +699,8 @@ def main() -> None:
 
     threading.Thread(target=_periodic_ip_broadcast, daemon=True).start()
 
-    start_ble_advertisement()
-    publish_gatt_only(ble)
+    while True:
+        time.sleep(60)
 
 
 if __name__ == "__main__":

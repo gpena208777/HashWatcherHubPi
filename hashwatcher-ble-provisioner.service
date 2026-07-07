@@ -1,5 +1,5 @@
 [Unit]
-Description=HashWatcher BLE Wi-Fi Provisioner
+Description=Hashwatcher BLE Wi-Fi Provisioner
 After=bluetooth.service network-pre.target
 Wants=bluetooth.service
 

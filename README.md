@@ -14,21 +14,21 @@ Turn any Raspberry Pi into a Tailscale-enabled HashWatcher hub with local setup 
 Flash **Raspberry Pi OS Lite (64-bit)** onto your Pi using [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Configure hostname `HashWatcherHub`, enable SSH, and set your user/password. The `HashWatcherHub` hostname is the most important part and should stay `HashWatcherHub` unless you have a specific reason to change it. Then:
 
 ```bash
-ssh hashwatcherhub@HashWatcherHub.local
+ssh hashwatcherhub@hashwatcherhub.local
 # Password: 90218
 
 curl -fsSL https://raw.githubusercontent.com/gpena208777/HashWatcherHubPi/main/install.sh | sudo bash
 ```
 
-The installer puts the hub software on the Pi. It is the same canonical installer used for self-install and manual SSH installs, and it only installs missing prerequisites before updating the hub app. **You still need the HashWatcher app to commission it**: connect over BLE, send Wi‑Fi credentials, and complete Tailscale setup there. Android users without the in-app setup flow should use `http://HashWatcherHub.local:8787` to finish setup in the browser.
+The installer puts the hub software on the Pi. It is the same canonical installer used for self-install and manual SSH installs, and it only installs missing prerequisites before updating the hub app. **You still need the HashWatcher app to commission it**: connect over BLE, send Wi‑Fi credentials, and complete Tailscale setup there. Android users without the in-app setup flow should use `http://hashwatcherhub.local:8787` to finish setup in the browser.
 
 ## Install via .deb package
 
 Download the latest `.deb` from [Releases](https://github.com/gpena208777/HashWatcherHubPi/releases):
 
 ```bash
-wget https://github.com/gpena208777/HashWatcherHubPi/releases/latest/download/hashwatcher-hub-pi_1.0.10_all.deb
-sudo dpkg -i hashwatcher-hub-pi_1.0.10_all.deb
+wget https://github.com/gpena208777/HashWatcherHubPi/releases/latest/download/hashwatcher-hub-pi_1.0.1_all.deb
+sudo dpkg -i hashwatcher-hub-pi_1.0.1_all.deb
 ```
 
 ## After installation
@@ -39,7 +39,7 @@ The installer only gets the software onto the Pi. **Commissioning is done in the
 2. Open the app → Hub setup. It discovers your hub via BLE (advertises as `HashWatcherHub`)
 3. Send Wi‑Fi credentials over BLE (no keyboard needed)
 4. Complete Tailscale setup in the app
-5. Android users without the in-app setup flow should use `http://HashWatcherHub.local:8787`
+5. Android users without the in-app setup flow should use `http://hashwatcherhub.local:8787`
 
 ## Services
 

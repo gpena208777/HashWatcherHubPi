@@ -12,6 +12,12 @@ import shutil
 import subprocess
 from typing import Any, Dict, List, Optional
 
+TAILSCALE_STATE_PATHS = (
+    "/var/lib/tailscale/tailscaled.state",
+    "/var/lib/tailscale/tailscaled.state.tmp",
+    "/var/lib/tailscale/tailscaled.state.bak",
+)
+
 
 def _run(cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
@@ -40,6 +46,16 @@ def _tailscale_bin() -> str:
         if os.path.exists(path):
             return path
     return "tailscale"
+
+
+def _rm_bin() -> str:
+    resolved = shutil.which("rm")
+    if resolved:
+        return resolved
+    for path in ("/usr/bin/rm", "/bin/rm"):
+        if os.path.exists(path):
+            return path
+    return "rm"
 
 
 def _sudo_run(cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -162,7 +178,7 @@ def setup(auth_key: str, subnet_cidr: Optional[str] = None) -> Dict[str, Any]:
             _ensure_ip_forwarding()
             _sudo_run(["systemctl", "start", "tailscaled"])
 
-            ts_hostname = os.getenv("PI_HOSTNAME", "HashWatcherHub")
+            ts_hostname = os.getenv("PI_HOSTNAME", "hashwatcherhub")
 
             # Keep the hub reachable on the local LAN while enabling subnet routing.
             # Accepting remote routes on the hub can steal local traffic and make the
@@ -346,7 +362,7 @@ def up() -> Dict[str, Any]:
 
     prefs = _get_prefs()
     routes = prefs.get("AdvertiseRoutes", []) or [] if prefs else []
-    ts_hostname = os.getenv("PI_HOSTNAME", "HashWatcherHub")
+    ts_hostname = os.getenv("PI_HOSTNAME", "hashwatcherhub")
     routes_str = ",".join(routes) if routes else ""
     _ensure_ip_forwarding()
     cmd = _tailscale_up_cmd(
@@ -374,6 +390,69 @@ def logout() -> Dict[str, Any]:
             return {"ok": False, "error": f"tailscale logout failed: {stderr}"}
 
     return {"ok": True}
+
+
+def purge_local_state() -> Dict[str, Any]:
+    """Remove the local tailscaled node-key state after logout.
+
+    `tailscale logout` is the graceful deauthorization step. This extra purge is
+    for factory reset: it makes the local Pi boot like a never-authenticated hub.
+    """
+    if not is_installed():
+        return {"ok": True, "message": "tailscale is not installed", "removed": []}
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    removed: List[str] = []
+
+    stop_result = _sudo_run(["systemctl", "stop", "tailscaled"], timeout=15)
+    if stop_result.returncode != 0:
+        detail = (stop_result.stderr or stop_result.stdout or "").strip()
+        errors.append(f"systemctl stop tailscaled failed: {detail or stop_result.returncode}")
+
+    rm_bin = _rm_bin()
+    for path in TAILSCALE_STATE_PATHS:
+        result = _sudo_run([rm_bin, "-f", path], timeout=10)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            errors.append(f"remove {path} failed: {detail or result.returncode}")
+        else:
+            removed.append(path)
+
+    start_result = _sudo_run(["systemctl", "start", "tailscaled"], timeout=15)
+    if start_result.returncode != 0:
+        detail = (start_result.stderr or start_result.stdout or "").strip()
+        warnings.append(f"systemctl start tailscaled failed: {detail or start_result.returncode}")
+
+    return {
+        "ok": not errors,
+        "removed": removed,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def factory_forget() -> Dict[str, Any]:
+    """Gracefully deauthorize Tailscale and purge local node-key state."""
+    if not is_installed():
+        return {"ok": True, "message": "tailscale is not installed", "wasInstalled": False}
+
+    logout_result = logout()
+    if not logout_result.get("ok"):
+        return {
+            "ok": False,
+            "error": logout_result.get("error", "tailscale logout failed"),
+            "logout": logout_result,
+        }
+
+    purge_result = purge_local_state()
+    return {
+        "ok": bool(purge_result.get("ok")),
+        "logout": logout_result,
+        "purge": purge_result,
+        "message": "Tailscale deauthorized and local node state purged." if purge_result.get("ok") else "Tailscale logout succeeded, but local state purge failed.",
+    }
+
 
 def _get_prefs() -> Optional[Dict[str, Any]]:
     """Read tailscale debug prefs for advertised routes."""

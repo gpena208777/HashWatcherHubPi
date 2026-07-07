@@ -16,6 +16,7 @@ LATEST_RELEASE_API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 LATEST_RELEASE_TAG=""
 LATEST_RELEASE_DEB_URL=""
 LATEST_RELEASE_ARCHIVE_URL=""
+PREFERRED_RELEASE_MODE="${HASHWATCHER_RELEASE_MODE:-source}"
 
 INSTALL_DIR="/opt/hashwatcher-hub-pi"
 CONFIG_DIR="/etc/hashwatcher-hub-pi"
@@ -23,6 +24,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_USER="hashwatcher-hub-pi"
 VENV_DIR="${INSTALL_DIR}/.venv"
 REQ_HASH_FILE="${INSTALL_DIR}/.requirements.sha256"
+VENDORED_BLUEZERO_WHEEL_REL="vendor/bluezero-0.9.1-py2.py3-none-any.whl"
 SOURCE_DIR=""
 
 RED='\033[0;31m'
@@ -143,6 +145,8 @@ ensure_clock_is_sane() {
 apt_update_with_clock_recovery() {
     local apt_output status
 
+    require_apt_archive_cache_healthy
+
     set +e
     apt_output="$(apt-get update -qq 2>&1)"
     status=$?
@@ -156,6 +160,8 @@ apt_update_with_clock_recovery() {
         info "apt repository signatures are not valid yet for the Pi clock; retrying after a clock sync."
         ensure_clock_is_sane || true
 
+        require_apt_archive_cache_healthy
+
         set +e
         apt_output="$(apt-get update -qq 2>&1)"
         status=$?
@@ -164,6 +170,9 @@ apt_update_with_clock_recovery() {
 
     if [[ ${status} -ne 0 ]]; then
         printf '%s\n' "${apt_output}" >&2
+        if apt_output_indicates_filesystem_damage "${apt_output}"; then
+            print_filesystem_repair_guidance
+        fi
         return "${status}"
     fi
 
@@ -173,6 +182,151 @@ apt_update_with_clock_recovery() {
     fi
 
     return 0
+}
+
+recover_interrupted_dpkg() {
+    info "Recovering interrupted dpkg state..."
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+}
+
+apt_output_indicates_filesystem_damage() {
+    grep -Eq "Structure needs cleaning|Input/output error" <<<"${1:-}"
+}
+
+print_filesystem_repair_guidance() {
+    cat >&2 <<'EOF'
+
+The Pi filesystem is reporting metadata damage while apt is using /var/cache/apt.
+This is below apt/dpkg; retrying the installer will keep failing until the filesystem
+is repaired or the microSD/image is replaced.
+
+Fast factory path:
+  1. Power the Pi down cleanly.
+  2. Reflash or replace the microSD card.
+  3. Re-run provisioning.
+
+Field recovery path:
+  sudo touch /forcefsck
+  sudo reboot
+
+If the error returns after fsck, treat the card or power path as bad.
+EOF
+}
+
+repair_apt_archive_cache() {
+    local repair_output status
+
+    set +e
+    repair_output="$(
+        mkdir -p /var/cache/apt/archives 2>&1
+        rm -rf /var/cache/apt/archives/partial 2>&1
+        if id _apt >/dev/null 2>&1; then
+            install -d -m 0700 -o _apt -g root /var/cache/apt/archives/partial 2>&1
+        else
+            install -d -m 0755 /var/cache/apt/archives/partial 2>&1
+        fi
+        touch /var/cache/apt/archives/.hashwatcher-write-test 2>&1
+        rm -f /var/cache/apt/archives/.hashwatcher-write-test 2>&1
+    )"
+    status=$?
+    set -e
+
+    if [[ ${status} -eq 0 ]]; then
+        return 0
+    fi
+
+    printf '%s\n' "${repair_output}" >&2
+    if apt_output_indicates_filesystem_damage "${repair_output}"; then
+        print_filesystem_repair_guidance
+    fi
+    return "${status}"
+}
+
+require_apt_archive_cache_healthy() {
+    if [[ -d /var/cache/apt/archives/partial ]]; then
+        return 0
+    fi
+
+    info "Repairing missing apt archive cache directory..."
+    repair_apt_archive_cache || fail "apt archive cache is not writable."
+}
+
+apt_install_with_dpkg_recovery() {
+    local apt_output status
+
+    require_apt_archive_cache_healthy
+
+    set +e
+    apt_output="$(DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" 2>&1)"
+    status=$?
+    set -e
+
+    if [[ ${status} -eq 0 ]]; then
+        return 0
+    fi
+
+    if grep -q "dpkg was interrupted, you must manually run 'sudo dpkg --configure -a'" <<<"${apt_output}"; then
+        printf '%s\n' "${apt_output}" >&2
+        recover_interrupted_dpkg || return 1
+
+        require_apt_archive_cache_healthy
+
+        set +e
+        apt_output="$(DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" 2>&1)"
+        status=$?
+        set -e
+    fi
+
+    if [[ ${status} -ne 0 ]]; then
+        printf '%s\n' "${apt_output}" >&2
+        if apt_output_indicates_filesystem_damage "${apt_output}"; then
+            print_filesystem_repair_guidance
+        fi
+        print_dpkg_diagnostics
+        return "${status}"
+    fi
+
+    return 0
+}
+
+print_dpkg_diagnostics() {
+    info "dpkg diagnostics:"
+    dpkg --audit 2>&1 || true
+    if [[ -f /var/log/dpkg.log ]]; then
+        info "Recent dpkg log:"
+        tail -n 40 /var/log/dpkg.log 2>&1 || true
+    fi
+}
+
+print_python_dependency_diagnostics() {
+    info "Python dependency diagnostics:"
+    "${VENV_DIR}/bin/python" -m pip --version 2>&1 || true
+    "${VENV_DIR}/bin/python" -m pip list 2>&1 || true
+    "${VENV_DIR}/bin/python" - <<'PY' 2>&1 || true
+import importlib.util
+
+required = ("requests", "dotenv", "bluezero", "dbus")
+for name in required:
+    print(f"{name}: {'present' if importlib.util.find_spec(name) else 'missing'}")
+PY
+}
+
+wait_for_service_healthy() {
+    local unit="$1"
+    local attempts="${2:-6}"
+    local delay_seconds="${3:-2}"
+    local i
+
+    for i in $(seq 1 "${attempts}"); do
+        if systemctl is-active --quiet "${unit}"; then
+            return 0
+        fi
+        sleep "${delay_seconds}"
+    done
+
+    systemctl --no-pager --full status "${unit}" 2>&1 || true
+    journalctl -u "${unit}" -n 80 --no-pager 2>&1 || true
+    return 1
 }
 
 is_rootfs_read_only() {
@@ -198,6 +352,67 @@ EOF
     fi
 }
 
+require_no_kernel_storage_errors() {
+    local kernel_log
+
+    if [[ "${HASHWATCHER_ALLOW_FS_ERRORS:-0}" == "1" ]]; then
+        info "Skipping kernel storage-error preflight because HASHWATCHER_ALLOW_FS_ERRORS=1."
+        return 0
+    fi
+
+    kernel_log="$(journalctl -k -n 300 --no-pager 2>/dev/null || dmesg -T 2>/dev/null || true)"
+    if [[ -z "${kernel_log}" ]]; then
+        return 0
+    fi
+
+    if grep -Eiq 'EXT4-fs error|I/O error|Buffer I/O|structure needs cleaning|mmcblk[^[:space:]]*.*error|end_request: I/O error' <<<"${kernel_log}"; then
+        {
+            echo
+            echo "Recent kernel storage/filesystem errors were detected:"
+            grep -Ei 'EXT4-fs error|I/O error|Buffer I/O|structure needs cleaning|mmcblk[^[:space:]]*.*error|end_request: I/O error' <<<"${kernel_log}" | tail -20
+            echo
+            echo "The Pi storage is not healthy enough for package installation."
+            echo "Reflash or replace the microSD card, then run provisioning again."
+            echo
+        } >&2
+        fail "Filesystem preflight failed before install."
+    fi
+}
+
+configure_sd_longevity() {
+    # Reduce microSD wear on an always-on appliance:
+    # - cap the persistent journal so journald stops growing/rotating large files
+    # - stop daily apt metadata churn (hub updates come from the HashWatcher installer/OTA)
+    # - keep the kernel from swapping to SD unless memory pressure is real
+    info "Applying SD-card longevity settings..."
+
+    install -d -m 0755 /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/hashwatcher-sd-care.conf <<'EOF'
+# Installed by HashWatcher Hub Pi. Caps journal writes to protect the microSD.
+[Journal]
+Storage=persistent
+SystemMaxUse=48M
+SystemMaxFileSize=8M
+MaxRetentionSec=14day
+EOF
+    systemctl restart systemd-journald 2>/dev/null || true
+
+    local timer
+    for timer in apt-daily.timer apt-daily-upgrade.timer man-db.timer; do
+        if systemctl list-unit-files "${timer}" >/dev/null 2>&1; then
+            systemctl disable --now "${timer}" >/dev/null 2>&1 || true
+        fi
+    done
+
+    cat > /etc/sysctl.d/98-hashwatcher-sd-care.conf <<'EOF'
+# Installed by HashWatcher Hub Pi. Prefer RAM over swapping to the microSD.
+vm.swappiness = 10
+EOF
+    sysctl -p /etc/sysctl.d/98-hashwatcher-sd-care.conf >/dev/null 2>&1 || true
+
+    ok "SD-card longevity settings applied."
+}
+
 required_files=(
     VERSION
     hashwatcher_hub_agent.py
@@ -208,6 +423,7 @@ required_files=(
     hashwatcher-hub.service
     hashwatcher-ble-provisioner.service
     hub.env.prepared
+    "${VENDORED_BLUEZERO_WHEEL_REL}"
 )
 
 required_packages=(
@@ -216,9 +432,8 @@ required_packages=(
     python3-pip
     python3-dev
     python3-dbus
-    python3-gi
-    python3-cairo
-    gir1.2-glib-2.0
+    python3-requests
+    python3-dotenv
     bluetooth
     bluez
     libbluetooth-dev
@@ -240,6 +455,9 @@ usage() {
 Usage:
   curl -fsSL https://raw.githubusercontent.com/gpena208777/HashWatcherHubPi/main/install.sh | sudo bash
   sudo bash install.sh --source-dir /path/to/hashwatcher-bundle
+
+Optional:
+  HASHWATCHER_RELEASE_MODE=deb    # prefer the GitHub release .deb asset first
 EOF
 }
 
@@ -296,7 +514,7 @@ install_latest_release_deb() {
 
     info "Installing latest release package..."
     apt_update_with_clock_recovery || fail "Package index update failed, likely because the Pi clock is still incorrect."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${deb_path}"; then
+    if ! apt_install_with_dpkg_recovery "${deb_path}"; then
         fail "Package install failed during apt/dpkg configure step."
     fi
 
@@ -327,14 +545,76 @@ venv_has_requirements() {
 import importlib.util
 import sys
 
-required = ("requests", "dotenv", "bluezero", "dbus", "gi")
+required = ("requests", "dotenv", "bluezero", "dbus")
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 sys.exit(0 if not missing else 1)
 PY
 }
 
-venv_uses_system_site_packages() {
-    [[ -f "${VENV_DIR}/pyvenv.cfg" ]] && grep -qi '^include-system-site-packages *= *true' "${VENV_DIR}/pyvenv.cfg"
+runtime_dependency_hash() {
+    local src_root="$1"
+    sha256sum \
+        "${src_root}/requirements.txt" \
+        "${src_root}/${VENDORED_BLUEZERO_WHEEL_REL}" | sha256sum | awk '{print $1}'
+}
+
+ensure_venv_uses_system_site_packages() {
+    local cfg="${VENV_DIR}/pyvenv.cfg"
+
+    [[ -f "${cfg}" ]] || return 0
+    if grep -q '^include-system-site-packages = true$' "${cfg}"; then
+        return 0
+    fi
+
+    info "Reconfiguring virtualenv to use system site-packages."
+    sed -i 's/^include-system-site-packages = false/include-system-site-packages = true/' "${cfg}"
+}
+
+ensure_venv_pip() {
+    if "${VENV_DIR}/bin/python" -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    info "Bootstrapping pip inside the virtual environment..."
+    "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || return 1
+    "${VENV_DIR}/bin/python" -m pip --version >/dev/null 2>&1
+}
+
+install_python_runtime_dependencies() {
+    local vendor_wheel="${INSTALL_DIR}/${VENDORED_BLUEZERO_WHEEL_REL}"
+
+    if [[ ! -f "${vendor_wheel}" ]]; then
+        fail "Missing bundled dependency wheel: ${vendor_wheel}"
+    fi
+
+    if ! ensure_venv_pip; then
+        fail "pip bootstrap failed in ${VENV_DIR}."
+    fi
+
+    if ! "${VENV_DIR}/bin/python" -m pip install --no-deps --quiet --force-reinstall "${vendor_wheel}"; then
+        info "Bundled bluezero install failed; re-running verbosely."
+        "${VENV_DIR}/bin/python" -m pip install --no-deps --force-reinstall "${vendor_wheel}" || {
+            print_python_dependency_diagnostics
+            fail "Installing bundled bluezero wheel failed."
+        }
+    fi
+
+    if venv_has_requirements; then
+        return 0
+    fi
+
+    info "System packages plus bundled wheel were incomplete; falling back to pip requirements install."
+    if ! "${VENV_DIR}/bin/python" -m pip install --prefer-binary --timeout 30 --retries 5 -r "${INSTALL_DIR}/requirements.txt" -q; then
+        info "Python dependency fallback failed; re-running pip verbosely for diagnostics."
+        "${VENV_DIR}/bin/python" -m pip install --prefer-binary --timeout 30 --retries 5 -r "${INSTALL_DIR}/requirements.txt" || true
+        print_python_dependency_diagnostics
+        fail "Python dependency install failed."
+    fi
+
+    if ! venv_has_requirements; then
+        print_python_dependency_diagnostics
+        fail "Python dependencies are still incomplete after installation."
+    fi
 }
 
 install_from_source() {
@@ -364,7 +644,7 @@ install_from_source() {
     if ((${#missing_packages[@]} > 0)); then
         info "Installing missing system packages: ${missing_packages[*]}"
         apt_update_with_clock_recovery || fail "Package index update failed, likely because the Pi clock is still incorrect."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing_packages[@]}"
+        apt_install_with_dpkg_recovery "${missing_packages[@]}" || fail "Installing required system packages failed."
     else
         ok "Required system packages already installed."
     fi
@@ -386,16 +666,20 @@ net.ipv6.conf.all.forwarding = 1
 EOF
     sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null 2>&1 || true
 
+    configure_sd_longevity
+
     if ! id "${SERVICE_USER}" &>/dev/null; then
         info "Creating service user: ${SERVICE_USER}"
         useradd -r -d "${INSTALL_DIR}" -s /usr/sbin/nologin "${SERVICE_USER}"
     fi
 
     install -d -m 0755 "${INSTALL_DIR}" "${CONFIG_DIR}" "${INSTALL_DIR}/updates"
+    install -d -m 0755 "${INSTALL_DIR}/vendor"
 
     for f in hashwatcher_hub_agent.py hub_ble_provisioner.py tailscale_setup.py requirements.txt; do
         install -m 0644 "${src}/${f}" "${INSTALL_DIR}/${f}"
     done
+    install -m 0644 "${src}/${VENDORED_BLUEZERO_WHEEL_REL}" "${INSTALL_DIR}/${VENDORED_BLUEZERO_WHEEL_REL}"
     install -m 0755 "${src}/ota_update_helper.sh" "${INSTALL_DIR}/ota_update_helper.sh"
 
     install -m 0644 "${src}/VERSION" "${INSTALL_DIR}/VERSION"
@@ -420,24 +704,19 @@ EOF
     append_config_if_missing "RUNTIME_CONFIG_PATH" "${INSTALL_DIR}/runtime_config.json"
     append_config_if_missing "LAST_WIFI_PATH" "${INSTALL_DIR}/last_wifi_credentials.json"
 
-    current_req_hash="$(sha256sum "${INSTALL_DIR}/requirements.txt" | awk '{print $1}')"
+    current_req_hash="$(runtime_dependency_hash "${src}")"
     saved_req_hash="$(cat "${REQ_HASH_FILE}" 2>/dev/null || true)"
-
-    if [[ -x "${VENV_DIR}/bin/python" ]] && ! venv_uses_system_site_packages; then
-        info "Recreating Python virtual environment with system DBus/GI bindings..."
-        rm -rf "${VENV_DIR}"
-    fi
 
     if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
         info "Creating Python virtual environment..."
         python3 -m venv --system-site-packages "${VENV_DIR}"
         venv_created=1
     fi
+    ensure_venv_uses_system_site_packages
 
     if [[ "${current_req_hash}" != "${saved_req_hash}" || "${venv_created}" -eq 1 ]] || ! venv_has_requirements; then
-        info "Installing Python dependencies. First install can take a few minutes on Pi Zero-class hardware..."
-        "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-        "${VENV_DIR}/bin/python" -m pip install --prefer-binary -r "${INSTALL_DIR}/requirements.txt"
+        info "Installing Python dependencies..."
+        install_python_runtime_dependencies
         printf '%s\n' "${current_req_hash}" > "${REQ_HASH_FILE}"
     else
         ok "Python dependencies unchanged; reusing existing virtualenv."
@@ -445,13 +724,15 @@ EOF
 
     cat > /etc/sudoers.d/hashwatcher-hub-pi <<'EOF'
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tailscale, /usr/bin/tailscale up *, /usr/bin/tailscale down, /usr/bin/tailscale logout, /usr/bin/tailscale status *, /usr/bin/tailscale debug *
-hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemctl start tailscaled, /usr/bin/systemctl restart tailscaled, /usr/bin/systemctl restart hashwatcher-hub-pi, /usr/bin/systemctl restart hashwatcher-ble-provisioner
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemctl start tailscaled, /usr/bin/systemctl stop tailscaled, /usr/bin/systemctl restart tailscaled, /usr/bin/systemctl restart hashwatcher-hub-pi, /usr/bin/systemctl restart hashwatcher-ble-provisioner
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/reboot
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/sysctl -w *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/wpa_cli *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/vcgencmd *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/journalctl *
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/rm -f /var/lib/tailscale/tailscaled.state, /usr/bin/rm -f /var/lib/tailscale/tailscaled.state.tmp, /usr/bin/rm -f /var/lib/tailscale/tailscaled.state.bak
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /bin/rm -f /var/lib/tailscale/tailscaled.state, /bin/rm -f /var/lib/tailscale/tailscaled.state.tmp, /bin/rm -f /var/lib/tailscale/tailscaled.state.bak
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness, /usr/bin/tee /sys/class/leds/*/trigger, /usr/bin/tee /sys/class/leds/*/delay_on, /usr/bin/tee /sys/class/leds/*/delay_off
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit hashwatcher-hub-update --collect --service-type=oneshot /opt/hashwatcher-hub-pi/ota_update_helper.sh *
@@ -465,6 +746,9 @@ EOF
     systemctl enable hashwatcher-ble-provisioner >/dev/null 2>&1 || true
     systemctl restart hashwatcher-hub-pi
     systemctl restart hashwatcher-ble-provisioner
+
+    wait_for_service_healthy hashwatcher-hub-pi 8 2 || fail "hashwatcher-hub-pi failed to become healthy after install."
+    wait_for_service_healthy hashwatcher-ble-provisioner 8 2 || fail "hashwatcher-ble-provisioner failed to become healthy after install."
 
     echo ""
     ok "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -495,6 +779,8 @@ done
 [[ "$(uname -s)" == "Linux" ]] || fail "This installer is for Linux (Raspberry Pi OS)."
 [[ "$(id -u)" -eq 0 ]] || fail "Please run as root."
 require_writable_rootfs
+require_no_kernel_storage_errors
+require_apt_archive_cache_healthy
 
 if [[ -n "${SOURCE_DIR}" ]]; then
     install_from_source "${SOURCE_DIR}"
@@ -515,15 +801,27 @@ else
     fail "Could not resolve latest release metadata from GitHub."
 fi
 
-if [[ -n "${LATEST_RELEASE_DEB_URL}" ]] && install_latest_release_deb "${LATEST_RELEASE_DEB_URL}" "${TMP_DIR}/hashwatcher-hub-pi.deb"; then
+if [[ "${PREFERRED_RELEASE_MODE}" == "deb" && -n "${LATEST_RELEASE_DEB_URL}" ]]; then
+    info "Release mode: deb-first"
+    if install_latest_release_deb "${LATEST_RELEASE_DEB_URL}" "${TMP_DIR}/hashwatcher-hub-pi.deb"; then
+        exit 0
+    fi
+    info "Falling back to latest release source archive."
+else
+    info "Release mode: source-first"
+fi
+
+if curl -fsSL "${LATEST_RELEASE_ARCHIVE_URL}" | tar -xz -C "${TMP_DIR}" --strip-components=1; then
+    info "Downloaded latest release archive (${LATEST_RELEASE_TAG})."
+    install_from_source "${TMP_DIR}"
     exit 0
 fi
 
-info "Falling back to latest release source archive."
-if curl -fsSL "${LATEST_RELEASE_ARCHIVE_URL}" | tar -xz -C "${TMP_DIR}" --strip-components=1; then
-    info "Downloaded latest release archive (${LATEST_RELEASE_TAG})."
-else
-    fail "Failed to download latest release archive (${LATEST_RELEASE_TAG})."
+if [[ -n "${LATEST_RELEASE_DEB_URL}" ]]; then
+    info "Source archive download failed; falling back to the GitHub release .deb asset."
+    if install_latest_release_deb "${LATEST_RELEASE_DEB_URL}" "${TMP_DIR}/hashwatcher-hub-pi.deb"; then
+        exit 0
+    fi
 fi
 
-install_from_source "${TMP_DIR}"
+fail "Failed to install HashWatcher Hub Pi from both the source archive and the .deb asset."

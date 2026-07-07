@@ -4,7 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
 User=hashwatcher-hub-pi
 Group=hashwatcher-hub-pi
 WorkingDirectory=/opt/hashwatcher-hub-pi
