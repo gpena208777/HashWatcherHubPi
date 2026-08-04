@@ -420,6 +420,7 @@ required_files=(
     tailscale_setup.py
     ota_update_helper.sh
     wifi_reset_helper.sh
+    wifi_power_save_helper.sh
     requirements.txt
     hashwatcher-hub.service
     hashwatcher-ble-provisioner.service
@@ -446,6 +447,7 @@ required_packages=(
     pkg-config
     meson
     wireless-tools
+    iw
     wpasupplicant
     network-manager
     curl
@@ -683,6 +685,7 @@ EOF
     install -m 0644 "${src}/${VENDORED_BLUEZERO_WHEEL_REL}" "${INSTALL_DIR}/${VENDORED_BLUEZERO_WHEEL_REL}"
     install -m 0755 "${src}/ota_update_helper.sh" "${INSTALL_DIR}/ota_update_helper.sh"
     install -m 0755 "${src}/wifi_reset_helper.sh" "${INSTALL_DIR}/wifi_reset_helper.sh"
+    install -m 0755 "${src}/wifi_power_save_helper.sh" "${INSTALL_DIR}/wifi_power_save_helper.sh"
 
     install -m 0644 "${src}/VERSION" "${INSTALL_DIR}/VERSION"
 
@@ -739,10 +742,13 @@ hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/class/leds/*/brightness
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/tee /boot/firmware/config.txt, /usr/bin/tee /boot/config.txt, /usr/bin/tee /etc/systemd/system/usb0-gadget.service
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload, /usr/bin/systemctl enable usb0-gadget.service, /usr/bin/systemctl start usb0-gadget.service
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/sbin/ip link set usb0 up, /usr/sbin/ip addr add 169.254.75.1/16 dev usb0
+hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /opt/hashwatcher-hub-pi/wifi_power_save_helper.sh *
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/dpkg -i /opt/hashwatcher-hub-pi/updates/*
 hashwatcher-hub-pi ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit hashwatcher-hub-update --collect --service-type=oneshot /opt/hashwatcher-hub-pi/ota_update_helper.sh *
 EOF
     chmod 0440 /etc/sudoers.d/hashwatcher-hub-pi
+
+    "${INSTALL_DIR}/wifi_power_save_helper.sh" wlan0 || true
 
     chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" "${CONFIG_DIR}"
 

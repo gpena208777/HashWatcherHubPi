@@ -361,6 +361,9 @@ class HubAgent:
         self.poll_seconds = max(HUB_MIN_POLL_SECONDS, env_int("POLL_SECONDS", HUB_DEFAULT_POLL_SECONDS))
         self.canaan_pid_loop_seconds = max(1, env_int("CANAAN_PID_LOOP_SECONDS", CANAAN_PID_LOOP_SECONDS))
         self.http_timeout_seconds = max(2, env_int("HTTP_TIMEOUT_SECONDS", 5))
+        self.network_recovery_interval_seconds = max(15, env_int("NETWORK_RECOVERY_INTERVAL_SECONDS", 60))
+        self.network_recovery_failure_threshold = max(2, env_int("NETWORK_RECOVERY_FAILURE_THRESHOLD", 3))
+        self.network_recovery_cooldown_seconds = max(120, env_int("NETWORK_RECOVERY_COOLDOWN_SECONDS", 300))
 
         self.status_http_bind = env_str("STATUS_HTTP_BIND", "0.0.0.0")
         self.status_http_port = max(1, env_int("STATUS_HTTP_PORT", 8787))
@@ -412,6 +415,9 @@ class HubAgent:
         self._led_lock = threading.Lock()
         self._led_default_trigger: Optional[str] = None
         self._self_heal_retry_after: Dict[str, float] = {}
+        self._network_wifi_failures = 0
+        self._network_tailscale_failures = 0
+        self._network_recovery_after = 0.0
 
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
@@ -3886,7 +3892,18 @@ class HubAgent:
         raise ValueError(f"Unexpected JSON type: {type(parsed)}")
 
     def _fetch_bitaxe_from_host(self, host: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
-        for endpoint in self.endpoints:
+        endpoints = list(self.endpoints)
+        if "/v2/miner/status" not in endpoints:
+            # Hammer firmware v2 exposes its live data outside the legacy
+            # Bitaxe routes. Keep the configured legacy order, then probe v2.
+            endpoints.append("/v2/miner/status")
+
+        for endpoint in endpoints:
+            if endpoint == "/v2/miner/status":
+                hammer_result = self._fetch_hammer_v2_from_host(host, timeout_seconds)
+                if hammer_result:
+                    return hammer_result
+                continue
             url = self._bitaxe_url(host, endpoint)
             try:
                 response = self.session.get(url, timeout=timeout_seconds)
@@ -3902,6 +3919,80 @@ class HubAgent:
             except Exception:
                 continue
         return None
+
+    def _fetch_hammer_v2_from_host(self, host: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+        """Read Hammer's v2 split API and present a Bitaxe-compatible payload."""
+        def get_v2_payload(endpoint: str) -> Optional[Dict[str, Any]]:
+            response = self.session.get(self._bitaxe_url(host, endpoint), timeout=timeout_seconds)
+            response.raise_for_status()
+            parsed = response.json()
+            if isinstance(parsed, dict) and parsed.get("ok") is False:
+                return None
+            return self._parse_payload_data(parsed)
+
+        try:
+            miner_status = get_v2_payload("/v2/miner/status")
+            if not miner_status:
+                return None
+            try:
+                device_info = get_v2_payload("/v2/device/info") or {}
+            except Exception:
+                device_info = {}
+            try:
+                device_status = get_v2_payload("/v2/device/status") or {}
+            except Exception:
+                device_status = {}
+
+            current_hashrate_hps = to_float(miner_status.get("current_hashrate")) or 0.0
+            board_temps = [
+                to_float(miner_status.get("temp_board")) or 0.0,
+                to_float(miner_status.get("temp_board_1")) or 0.0,
+            ]
+            input_voltage = to_float(miner_status.get("input_voltage")) or 0.0
+            core_voltage = to_float(miner_status.get("coreVoltage")) or 0.0
+            if 0 < core_voltage < 500:
+                core_voltage *= 10.0
+            if 0 < input_voltage < 500:
+                input_voltage *= 1000.0
+
+            data: Dict[str, Any] = {
+                "_hashwatcher_hammer_v2": True,
+                "deviceType": "hammer",
+                "deviceModel": device_info.get("device_model") or "Hammer",
+                "ASICModel": device_info.get("chip_type"),
+                "macAddr": device_info.get("mac_address"),
+                "version": device_info.get("firmware_version"),
+                "hostip": device_status.get("ip_address"),
+                "hostname": device_status.get("hostname"),
+                "ssid": device_status.get("wifi_ssid"),
+                "wifiRSSI": device_status.get("wifi_rssi"),
+                # Existing raw consumers treat Bitaxe hashRate as GH/s.
+                "hashRate": current_hashrate_hps / 1_000_000_000.0,
+                "current_hashrate": current_hashrate_hps,
+                "temp": max(board_temps),
+                "vrTemp": miner_status.get("temp_vcore"),
+                "power": miner_status.get("power_consumption"),
+                "voltage": input_voltage,
+                "coreVoltage": core_voltage,
+                "frequency": miner_status.get("frequency"),
+                "fanrpm": miner_status.get("fan_speed_rpm"),
+                "fanspeed": miner_status.get("fan_target_speed"),
+                "sharesAccepted": miner_status.get("shares_accepted"),
+                "sharesRejected": miner_status.get("shares_rejected"),
+                "bestDiff": miner_status.get("bestDiff"),
+                "bestSessionDiff": miner_status.get("bestSessionDiff"),
+                "uptimeSeconds": device_status.get("uptime_seconds"),
+                "stratumURL": miner_status.get("pool_url"),
+                "stratumPort": miner_status.get("pool_port"),
+            }
+            return {
+                "ip": host,
+                "endpoint": "/v2/miner/status",
+                "source_url": self._bitaxe_url(host, "/v2/miner/status"),
+                "data": data,
+            }
+        except Exception:
+            return None
 
     def fetch_paired_miner(self) -> Optional[Dict[str, Any]]:
         if not self.paired or not self.bitaxe_host.strip():
@@ -3953,6 +4044,8 @@ class HubAgent:
         combined = " ".join(parts)
         if "bitdsk" in combined:
             return "bitdsk"
+        if "hammer" in combined:
+            return "hammer"
         if "octaxe" in combined or "octa" in combined:
             return "octaxe"
         if "nerdq" in combined or "qaxe" in combined:
@@ -4411,7 +4504,10 @@ class HubAgent:
             return updated
 
     def normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        is_hammer_v2 = bool(data.get("_hashwatcher_hammer_v2"))
         hashrate_ths = pick_first(data, ["hashRate", "hashRate_1m", "hashRateavg"])
+        if is_hammer_v2:
+            hashrate_ths = (to_float(data.get("current_hashrate")) or 0.0) / 1_000_000_000_000.0
         temp_c = pick_first(data, ["temp", "boardtemp", "boardTemp"])
         vr_temp_c = pick_first(data, ["vrTemp", "vrtemp"])
         power_w = pick_first(data, ["power"])
@@ -5339,8 +5435,10 @@ class HubAgent:
     def _self_heal_loop(self) -> None:
         """Background loop that periodically checks health and auto-repairs what it can.
 
-        Runs every 60s. Auto-repairs USB gadget issues (no user input needed).
-        Logs Tailscale issues but can't auto-fix without an auth key.
+        Runs every 60s. Auto-repairs USB gadget issues (no user input needed)
+        with a per-finding retry window so a persistent boot-config fault does
+        not generate a write and log entry every minute. Tailscale credential
+        faults still require an auth key and are only reported here.
         """
         HEAL_INTERVAL = 60
         time.sleep(30)  # let services settle after boot
@@ -5365,8 +5463,20 @@ class HubAgent:
                         self._log("self-heal", f"Auto-repairing USB gadget: {issue}", level="info")
                         result = tailscale_setup.repair_usb_gadget()
                         if result.get("ok"):
-                            self._self_heal_retry_after.pop(retry_key, None)
-                            self._log("self-heal", f"USB gadget repair succeeded: {result.get('actionsTaken', [])}", level="info")
+                            remaining = {
+                                f"{item.get('component', '')}:{item.get('issue', '')}:{item.get('repairAction', '')}"
+                                for item in result.get("postRepairStatus", {}).get("findings", [])
+                            }
+                            if retry_key in remaining:
+                                self._self_heal_retry_after[retry_key] = time.time() + 3600
+                                self._log(
+                                    "self-heal",
+                                    f"USB gadget repair did not clear {issue}; pausing retries for one hour.",
+                                    level="warn",
+                                )
+                            else:
+                                self._self_heal_retry_after.pop(retry_key, None)
+                                self._log("self-heal", f"USB gadget repair succeeded: {result.get('actionsTaken', [])}", level="info")
                         else:
                             self._self_heal_retry_after[retry_key] = time.time() + 3600
                             self._log("self-heal", f"USB gadget repair had errors: {result.get('errors', [])}", level="warn")
@@ -5378,6 +5488,89 @@ class HubAgent:
                 self._log("self-heal", f"Self-heal loop error: {exc}")
 
             time.sleep(HEAL_INTERVAL)
+
+    def _run_network_recovery_command(self, command: List[str], timeout: int = 20) -> str:
+        """Run a narrowly scoped recovery command and return a concise result."""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            return "timed out"
+        except Exception as exc:  # pylint: disable=broad-except
+            return str(exc)
+        detail = (result.stderr or result.stdout or "").strip().replace("\n", " ")
+        return "ok" if result.returncode == 0 else (detail[:180] or f"exit {result.returncode}")
+
+    def _recover_wifi_connection(self) -> None:
+        """Ask NetworkManager to reconnect wlan0 without rebooting the Pi."""
+        managed = self._run_network_recovery_command(
+            ["sudo", "-n", "nmcli", "device", "set", "wlan0", "managed", "yes"]
+        )
+        reconnect = self._run_network_recovery_command(
+            ["sudo", "-n", "nmcli", "device", "connect", "wlan0"], timeout=45
+        )
+        self._log(
+            "network-watchdog",
+            f"Wi-Fi recovery requested for wlan0 (managed={managed}; reconnect={reconnect}).",
+            level="warn",
+        )
+
+    def _network_recovery_loop(self) -> None:
+        """Recover transient WLAN or Tailscale stalls without rebooting the hub.
+
+        A network may briefly disappear during an AP roam or DHCP renewal. The
+        threshold prevents reacting to those normal blips; a cooldown prevents
+        recovery commands from thrashing a router or the Wi-Fi driver.
+        """
+        time.sleep(90)  # NetworkManager and Tailscale need time to settle after boot.
+        while True:
+            try:
+                wifi = self.get_wifi_status()
+                ts_status = tailscale_setup.status()
+
+                if not wifi.get("connected"):
+                    self._network_wifi_failures += 1
+                    self._network_tailscale_failures = 0
+                else:
+                    self._network_wifi_failures = 0
+                    if ts_status.get("authenticated") and not ts_status.get("online"):
+                        self._network_tailscale_failures += 1
+                    else:
+                        self._network_tailscale_failures = 0
+
+                threshold_reached = (
+                    self._network_wifi_failures >= self.network_recovery_failure_threshold
+                    or self._network_tailscale_failures >= self.network_recovery_failure_threshold
+                )
+                if threshold_reached and time.time() >= self._network_recovery_after:
+                    self._network_recovery_after = time.time() + self.network_recovery_cooldown_seconds
+                    if self._network_wifi_failures >= self.network_recovery_failure_threshold:
+                        self._log(
+                            "network-watchdog",
+                            f"wlan0 has been disconnected for {self._network_wifi_failures} checks; reconnecting Wi-Fi.",
+                            level="warn",
+                        )
+                        self._recover_wifi_connection()
+                        self._network_wifi_failures = 0
+                    else:
+                        self._log(
+                            "network-watchdog",
+                            f"Tailscale has been offline for {self._network_tailscale_failures} checks while Wi-Fi is connected; restarting tailscaled.",
+                            level="warn",
+                        )
+                        result = tailscale_setup.restart_daemon()
+                        if result.get("ok"):
+                            self._log("network-watchdog", "tailscaled restart requested successfully.", level="info")
+                        else:
+                            self._log(
+                                "network-watchdog",
+                                f"tailscaled restart failed: {result.get('error', 'unknown error')}",
+                                level="warn",
+                            )
+                        self._network_tailscale_failures = 0
+            except Exception as exc:  # pylint: disable=broad-except
+                self._log("network-watchdog", f"Network recovery loop error: {exc}", level="warn")
+
+            time.sleep(self.network_recovery_interval_seconds)
 
     def _systemd_watchdog_loop(self) -> None:
         """Feed the systemd watchdog while the main poll loop is alive.
@@ -5436,6 +5629,7 @@ class HubAgent:
         sd_notify("READY=1")
 
         threading.Thread(target=self._self_heal_loop, daemon=True, name="self-heal").start()
+        threading.Thread(target=self._network_recovery_loop, daemon=True, name="network-watchdog").start()
         threading.Thread(target=self._canaan_pid_loop, daemon=True, name="canaan-pid").start()
         threading.Thread(target=self._systemd_watchdog_loop, daemon=True, name="sd-watchdog").start()
 

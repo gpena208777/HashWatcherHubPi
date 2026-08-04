@@ -261,6 +261,7 @@ def status() -> Dict[str, Any]:
         "hostname": None,
         "advertisedRoutes": [],
         "online": False,
+        "healthMessages": [],
         "keyExpiry": None,
         "keyExpired": False,
         "keyExpiringSoon": False,
@@ -280,13 +281,13 @@ def status() -> Dict[str, Any]:
 
     backend_state = data.get("BackendState", "")
     health_messages = [str(item).strip() for item in (data.get("Health") or []) if str(item).strip()]
+    info["healthMessages"] = health_messages
     health_text = " ".join(health_messages).lower()
     auth_url = str(data.get("AuthURL") or "").strip()
     info["running"] = backend_state != "Stopped"
 
     self_node = data.get("Self", {})
     self_online = bool(self_node.get("Online"))
-    self_active = bool(self_node.get("Active"))
     tailscale_ips = self_node.get("TailscaleIPs", [])
     if tailscale_ips:
         info["ip"] = tailscale_ips[0]
@@ -301,7 +302,10 @@ def status() -> Dict[str, Any]:
         or "requires authentication" in health_text
     )
     info["authenticated"] = info["running"] and not logged_out and bool(info["ip"])
-    info["online"] = info["authenticated"] and (self_online or self_active)
+    # Active only means the local WireGuard engine has a peer path; it can stay
+    # true after the Wi-Fi/control connection has gone stale. Online is the
+    # meaningful signal for the hub's remote-access watchdog.
+    info["online"] = info["authenticated"] and self_online
 
     key_expiry_raw = self_node.get("KeyExpiry")
     if key_expiry_raw:
@@ -332,6 +336,20 @@ def status() -> Dict[str, Any]:
         info["routesPending"] = False
 
     return info
+
+
+def restart_daemon() -> Dict[str, Any]:
+    """Restart only tailscaled, preserving login and advertised-route state."""
+    if not is_installed():
+        return {"ok": False, "error": "Tailscale is not installed"}
+    try:
+        result = _sudo_run(["systemctl", "restart", "tailscaled"], timeout=30)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Timed out restarting tailscaled"}
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return {"ok": False, "error": detail or "systemctl restart tailscaled failed"}
+    return {"ok": True, "status": status()}
 
 
 def down() -> Dict[str, Any]:
