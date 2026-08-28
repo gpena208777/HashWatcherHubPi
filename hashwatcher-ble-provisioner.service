@@ -1,5 +1,5 @@
 [Unit]
-Description=Hashwatcher BLE Wi-Fi Provisioner
+Description=HashWatcher BLE Wi-Fi Provisioner
 After=bluetooth.service network-pre.target
 Wants=bluetooth.service
 
@@ -17,7 +17,7 @@ ExecStartPre=/bin/sleep 1
 ExecStart=/opt/hashwatcher-hub-pi/.venv/bin/python /opt/hashwatcher-hub-pi/hub_ble_provisioner.py
 Restart=always
 RestartSec=5
-StandardOutput=journal
+StandardOutput=null
 StandardError=journal
 
 [Install]

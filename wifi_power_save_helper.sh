@@ -18,16 +18,28 @@ EOF
 chmod 0644 "${NM_CONF_PATH}"
 
 # Existing profiles can override the global default, so update the active one.
+# This persists the setting, but NetworkManager cannot apply it to an already
+# associated device. Do not use `nmcli device reapply` here: it only logs an
+# expected error and does not change the radio's current state.
 if command -v nmcli >/dev/null 2>&1; then
     connection="$(nmcli -g GENERAL.CONNECTION device show "${INTERFACE}" 2>/dev/null | head -n1 || true)"
     if [[ -n "${connection}" && "${connection}" != "--" ]]; then
         nmcli connection modify "${connection}" 802-11-wireless.powersave 2 || true
-        nmcli device reapply "${INTERFACE}" || true
+        nmcli connection reload || true
     fi
 fi
 
-# Apply immediately; the NetworkManager configuration keeps this after a
-# reconnect or reboot.
-if command -v iw >/dev/null 2>&1; then
-    iw dev "${INTERFACE}" set power_save off || true
+# Disable it in the Wi-Fi driver immediately. NetworkManager's global setting
+# and the saved profile above ensure the setting survives a reconnect or reboot.
+if ! command -v iw >/dev/null 2>&1; then
+    echo "[HashWatcher] ERROR: 'iw' is required to disable Wi-Fi power saving immediately." >&2
+    exit 1
+fi
+
+iw dev "${INTERFACE}" set power_save off
+power_save_state="$(iw dev "${INTERFACE}" get power_save)"
+printf '%s\n' "${power_save_state}"
+if ! grep -qx 'Power save: off' <<<"${power_save_state}"; then
+    echo "[HashWatcher] ERROR: Wi-Fi power saving is still enabled on ${INTERFACE}." >&2
+    exit 1
 fi

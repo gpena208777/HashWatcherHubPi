@@ -381,19 +381,23 @@ require_no_kernel_storage_errors() {
 
 configure_sd_longevity() {
     # Reduce microSD wear on an always-on appliance:
-    # - cap the persistent journal so journald stops growing/rotating large files
+    # - retain only OS/kernel errors across reboot (not routine service output)
     # - stop daily apt metadata churn (hub updates come from the HashWatcher installer/OTA)
     # - keep the kernel from swapping to SD unless memory pressure is real
     info "Applying SD-card longevity settings..."
 
     install -d -m 0755 /etc/systemd/journald.conf.d
     cat > /etc/systemd/journald.conf.d/hashwatcher-sd-care.conf <<'EOF'
-# Installed by HashWatcher Hub Pi. Caps journal writes to protect the microSD.
+# Installed by HashWatcher Hub Pi. Retains OS/kernel errors across reboot while
+# keeping routine logs in RAM to protect the microSD.
 [Journal]
 Storage=persistent
-SystemMaxUse=48M
-SystemMaxFileSize=8M
-MaxRetentionSec=14day
+MaxLevelStore=err
+SystemMaxUse=16M
+SystemMaxFileSize=1M
+MaxRetentionSec=30day
+RateLimitIntervalSec=30s
+RateLimitBurst=100
 EOF
     systemctl restart systemd-journald 2>/dev/null || true
 
@@ -409,6 +413,15 @@ EOF
 vm.swappiness = 10
 EOF
     sysctl -p /etc/sysctl.d/98-hashwatcher-sd-care.conf >/dev/null 2>&1 || true
+
+    # Raspberry Pi OS images that ship dphys-swapfile place swap on the
+    # microSD. The hub has a small steady-state memory footprint, so prefer an
+    # out-of-memory restart over sustained swap writes. Do not disable zram if
+    # an image already provides it, because zram is RAM-backed.
+    if systemctl list-unit-files dphys-swapfile.service >/dev/null 2>&1; then
+        swapoff /var/swap 2>/dev/null || true
+        systemctl disable --now dphys-swapfile.service >/dev/null 2>&1 || true
+    fi
 
     ok "SD-card longevity settings applied."
 }

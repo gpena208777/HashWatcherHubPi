@@ -14,7 +14,9 @@ EnvironmentFile=/etc/hashwatcher-hub-pi/hub.env
 ExecStart=/opt/hashwatcher-hub-pi/.venv/bin/python /opt/hashwatcher-hub-pi/hashwatcher_hub_agent.py
 Restart=always
 RestartSec=5
-StandardOutput=journal
+# Routine miner/proxy failures are intentionally not persisted to the SD card.
+# Uncaught service failures still arrive on stderr and are retained as journal errors.
+StandardOutput=null
 StandardError=journal
 
 [Install]

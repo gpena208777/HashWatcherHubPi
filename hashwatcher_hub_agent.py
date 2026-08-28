@@ -104,9 +104,6 @@ DEVICE_LOG_STREAMS: Dict[str, Dict[str, Any]] = {
     "kernel": {"label": "Kernel", "kernel": True},
 }
 
-DEFAULT_PERSISTENT_LOG_PATH = "/opt/hashwatcher-hub-pi/logs/hub-agent.log"
-DEFAULT_PERSISTENT_LOG_MAX_BYTES = 512 * 1024
-DEFAULT_PERSISTENT_LOG_BACKUP_COUNT = 2
 DEFAULT_LOG_BUNDLE_MAX_BYTES = 1_500_000
 DEFAULT_LOG_BUNDLE_COMPACT_MAX_LINES = 180
 
@@ -422,16 +419,15 @@ class HubAgent:
         self._error_log: List[Dict[str, Any]] = []
         self._log_lock = threading.Lock()
         self._max_log_entries = max(200, min(5000, env_int("INTERNAL_LOG_MAX_ENTRIES", 1500)))
-        self.persistent_log_path = env_str("PERSISTENT_LOG_PATH", DEFAULT_PERSISTENT_LOG_PATH)
-        self.persistent_log_max_bytes = max(128 * 1024, env_int("PERSISTENT_LOG_MAX_BYTES", DEFAULT_PERSISTENT_LOG_MAX_BYTES))
-        self.persistent_log_backup_count = max(1, min(5, env_int("PERSISTENT_LOG_BACKUP_COUNT", DEFAULT_PERSISTENT_LOG_BACKUP_COUNT)))
         self.log_bundle_max_bytes = max(256 * 1024, env_int("LOG_BUNDLE_MAX_BYTES", DEFAULT_LOG_BUNDLE_MAX_BYTES))
         self.log_bundle_compact_default = parse_bool(env_str("LOG_BUNDLE_COMPACT_DEFAULT", "1"), default=True)
         self.log_bundle_compact_max_lines = max(
             50,
             min(800, env_int("LOG_BUNDLE_COMPACT_MAX_LINES", DEFAULT_LOG_BUNDLE_COMPACT_MAX_LINES)),
         )
-        self._load_persistent_internal_logs()
+        # Miner/proxy failures are operational telemetry, not durable device
+        # diagnostics. Keep them in memory for the current session only. The
+        # installer retains a small on-disk journal for OS/kernel-level errors.
 
     def _log(self, source: str, message: str, level: str = "error") -> None:
         entry: Dict[str, Any] = {
@@ -445,82 +441,6 @@ class HubAgent:
             self._error_log.append(entry)
             if len(self._error_log) > self._max_log_entries:
                 self._error_log = self._error_log[-self._max_log_entries:]
-        self._append_persistent_internal_log(entry)
-
-    def _persistent_log_files_oldest_first(self) -> List[str]:
-        files = [
-            f"{self.persistent_log_path}.{idx}"
-            for idx in range(self.persistent_log_backup_count, 0, -1)
-        ]
-        files.append(self.persistent_log_path)
-        return files
-
-    def _load_persistent_internal_logs(self) -> None:
-        entries: List[Dict[str, Any]] = []
-        for path in self._persistent_log_files_oldest_first():
-            if not os.path.exists(path):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    for raw in f:
-                        line = raw.strip()
-                        if not line:
-                            continue
-                        try:
-                            parsed = json.loads(line)
-                        except Exception:
-                            continue
-                        if not isinstance(parsed, dict):
-                            continue
-                        if "message" not in parsed:
-                            continue
-                        entries.append({
-                            "ts": str(parsed.get("ts") or now_iso()),
-                            "level": str(parsed.get("level") or "info"),
-                            "source": str(parsed.get("source") or ""),
-                            "message": str(parsed.get("message") or ""),
-                        })
-            except Exception as exc:  # pylint: disable=broad-except
-                print(f"[{now_iso()}] WARNING: failed to read persistent logs from {path}: {exc}", flush=True)
-                continue
-
-        if not entries:
-            return
-        with self._log_lock:
-            self._error_log = entries[-self._max_log_entries:]
-
-    def _rotate_persistent_internal_logs(self) -> None:
-        base = self.persistent_log_path
-        try:
-            oldest = f"{base}.{self.persistent_log_backup_count}"
-            if os.path.exists(oldest):
-                os.remove(oldest)
-            for idx in range(self.persistent_log_backup_count - 1, 0, -1):
-                src = f"{base}.{idx}"
-                dst = f"{base}.{idx + 1}"
-                if os.path.exists(src):
-                    os.replace(src, dst)
-            if os.path.exists(base):
-                os.replace(base, f"{base}.1")
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"[{now_iso()}] WARNING: failed rotating persistent logs: {exc}", flush=True)
-
-    def _append_persistent_internal_log(self, entry: Dict[str, Any]) -> None:
-        try:
-            log_dir = os.path.dirname(self.persistent_log_path)
-            if log_dir:
-                os.makedirs(log_dir, exist_ok=True)
-            line = json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n"
-            line_bytes = len(line.encode("utf-8"))
-            current_size = 0
-            if os.path.exists(self.persistent_log_path):
-                current_size = os.path.getsize(self.persistent_log_path)
-            if current_size + line_bytes > self.persistent_log_max_bytes:
-                self._rotate_persistent_internal_logs()
-            with open(self.persistent_log_path, "a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"[{now_iso()}] WARNING: failed writing persistent log entry: {exc}", flush=True)
 
     def get_internal_logs(self, limit: int = 100, level_filter: Optional[str] = None) -> Dict[str, Any]:
         safe_limit = parse_int(limit, default=100, minimum=1, maximum=1000)
@@ -609,10 +529,7 @@ class HubAgent:
         lines.append(f"Agent Version: {AGENT_VERSION}")
         lines.append(f"Status API Version: {STATUS_API_VERSION}")
         lines.append(f"Bundle Mode: {'compact' if compact_mode else 'full'}")
-        lines.append(
-            "Persistent Internal Log Storage: "
-            f"{self.persistent_log_path} (max {self.persistent_log_max_bytes} bytes, backups {self.persistent_log_backup_count})"
-        )
+        lines.append("Internal Agent Logs: memory only (cleared on hub restart).")
         lines.append("")
         lines.append("===== STATUS SNAPSHOT =====")
         status_payload = {
@@ -4605,7 +4522,11 @@ class HubAgent:
                 feature_gates = agent.feature_gates_status()
                 local_clock = agent.local_clock_status()
                 fleet_manager = agent.get_fleet_manager_status()
-                paired_status = agent.is_paired_status(wifi_status, ts_status)
+                # Miner pairing is independent of transport readiness.  A hub
+                # can retain its selected miner while Wi-Fi, Tailscale, or
+                # subnet-route approval is temporarily unavailable.  Those
+                # states are reported separately below.
+                paired_status = agent.paired
                 setup_complete = agent.is_setup_complete(wifi_status, ts_status)
 
                 status = {
@@ -4669,12 +4590,8 @@ class HubAgent:
                         "ok": True,
                         "count": logs_result.get("total", 0),
                         "entries": logs_result.get("entries", []),
-                        "persistentHistory": True,
-                        "storage": {
-                            "path": agent.persistent_log_path,
-                            "maxBytes": agent.persistent_log_max_bytes,
-                            "backupCount": agent.persistent_log_backup_count,
-                        },
+                        "persistentHistory": False,
+                        "storage": {"mode": "memory"},
                     })
                     return
 
